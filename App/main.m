@@ -1,4 +1,4 @@
-// 极速IOS（原 SIOriginal）— 配置 App v2.4.2（TrollStore 安装）
+// 极速IOS（原 SIOriginal）— 配置 App v2.4.4（TrollStore 安装）
 // 重制版配套配置器：写 Managed Preferences plist + 发 Darwin 通知热重载。
 // v2.0.0：Tab 卡片式 UI、一键预设、配置导入/导出、注入环境自检、新引擎参数。
 // v2.1.20：① 出厂默认与 dylib 对齐（原来界面显示 ×15、引擎实际 40×，且一保存就降速）；
@@ -8,6 +8,7 @@
 //          ④ 功能：新增「恢复出厂设置」（此前只能手工删 plist）。
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/message.h>   // v2.5.0：运行时探测 iOS 26 的 UIGlassEffect（旧 SDK 无此符号）
 #import <spawn.h>
 #import <sys/wait.h>
 #import <sys/stat.h>
@@ -42,7 +43,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.4.3";
+static NSString * const SIO_VERSION = @"v2.4.4";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -262,6 +263,19 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
         if (cfg[k]) merged[k] = cfg[k];
     }
     BOOL ok = [merged writeToFile:PrefPath atomically:YES];
+    if (!ok) {
+        // v2.4.4 修复「不能保存配置」：/var/Managed Preferences/mobile 一旦被
+        // root 拥有的进程（或旧版提权写入器）动过，目录/旧 plist 属主漂移成 root，
+        // mobile 身份的 App 原子写（先建临时文件再 rename）必败（EPERM），表现为
+        // 点保存永远失败。借 TrollStore persona 提权把属主还回 mobile 再重试一次。
+        NSLog(@"[SIO] WriteConfig direct write failed (errno=%d %s), fixing ownership as root and retrying",
+              errno, strerror(errno));
+        SpawnRoot(@"/usr/sbin/chown", @[@"-R", @"mobile:mobile", @"/var/Managed Preferences/mobile"]);
+        SpawnRoot(@"/bin/chmod", @[@"755", @"/var/Managed Preferences/mobile"]);
+        ok = [merged writeToFile:PrefPath atomically:YES];
+        if (!ok) NSLog(@"[SIO] WriteConfig retry after chown still failed (errno=%d %s)",
+                       errno, strerror(errno));
+    }
     if (ok) {
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                              (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
@@ -498,30 +512,63 @@ static int TransIndexFor(double t) {
     return 0;
 }
 
-#pragma mark - UI 小部件构造（v2.1.20：对齐 Apple HIG 的设计令牌）
+#pragma mark - v2.5.0 Liquid Glass 设计系统（iOS 26 玻璃质感）
 
 // ---------------------------------------------------------------------------
-// v2.1.20 设计系统（Apple HIG 对齐）
-// 1) 字体：所有字号走 UIFontMetrics（Dynamic Type），随「设置 → 显示与亮度 → 文字大小」
-//    与「辅助功能 → 更大字体」自动缩放；上限 1.6×（头部 1.3×），避免固定高度的控件被撑破。
-// 2) 颜色：一律语义色（labelColor / secondaryLabelColor / systemGroupedBackgroundColor…），
-//    品牌强调色改为动态色，深色模式自动提亮 —— 不再写死 RGB 导致深色下发暗。
-// 3) 形状：continuous 连续曲率圆角（苹果图标/卡片的默认曲线），分组卡片去掉描边与阴影，
-//    改为「同色卡片 + 背景层级差」的扁平语言。
-// 4) 控件最小高度而非固定高度：文字放大时控件跟着长，而不是把文字裁掉。
+// 设计语言（对应设计稿 739511358881514）：
+//   ① 底：环境光斑 —— 三团径向渐变（祖母绿 / 天蓝 / 青柠），浅深各一套
+//   ② 玻璃：UIVisualEffectView（iOS 26 优先用 UIGlassEffect，老系统回落
+//      UIBlurEffectSystemMaterial）+ 半透明白 tint（浅 66% / 深 10%）
+//   ③ 高光：顶部 55% 高度的白色 sheen + 1px 内侧描边
+//   ④ 阴影：近 2 / 远 18 的双层投影
+//   ⑤ 反馈：按下缩到 0.975、透明度 0.92，120ms 进 / 180ms 回
+//
+// 与 v2.1.20 相比的两处硬性改进：
+//   · 所有 CGColor 快照（描边 / 阴影 / 渐变）由视图自己在 trait 变化时重刷，
+//     不再依赖页面基类递归扫 borderWidth —— 老实现会把玻璃描边冲成 separatorColor；
+//   · 颜色一律走 dynamic provider，浅深切换不需要第二套颜色常量。
 // ---------------------------------------------------------------------------
 
-static UIFont *SIOFontCapped(CGFloat size, UIFontWeight weight, CGFloat cap) {
-    UIFont *base = [UIFont systemFontOfSize:size weight:weight];
-    UIFont *f = [[UIFontMetrics defaultMetrics] scaledFontForFont:base
-                                                 maximumPointSize:round(size * cap)];
-    return f ?: base;
-}
-static UIFont *SIOFont(CGFloat size, UIFontWeight weight) {
-    return SIOFontCapped(size, weight, 1.6);
+static UIColor *SIO_RGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
+    return [UIColor colorWithRed:r green:g blue:b alpha:a];
 }
 
-// 品牌色：祖母绿。浅色模式用深一点的祖母绿保证对比度，深色模式提亮
+static UIColor *SIO_Dyn(UIColor *(^light)(void), UIColor *(^dark)(void)) {
+    if (@available(iOS 13.0, *)) {
+        return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+            return (tc.userInterfaceStyle == UIUserInterfaceStyleDark) ? dark() : light();
+        }];
+    }
+    return light();
+}
+
+// 语义色：与设计稿令牌同名（Glass 变量集）
+static UIColor *SIOBG(void)            { return SIO_Dyn(^{ return SIO_RGBA(0.945,0.965,0.953,1.0); },
+                                                        ^{ return SIO_RGBA(0.020,0.031,0.043,1.0); }); }
+static UIColor *SIOSurface(void)       { return SIO_Dyn(^{ return SIO_RGBA(1,1,1,0.66); },
+                                                        ^{ return SIO_RGBA(1,1,1,0.10); }); }
+static UIColor *SIOSurfaceStrong(void) { return SIO_Dyn(^{ return SIO_RGBA(1,1,1,0.82); },
+                                                        ^{ return SIO_RGBA(1,1,1,0.17); }); }
+// iOS 26 的 UIGlassEffect 自带折射与 layer 感，再压 66% 白就成白板了，这里收薄
+static UIColor *SIOSurfaceGlass26(void) { return SIO_Dyn(^{ return SIO_RGBA(1,1,1,0.42); },
+                                                         ^{ return SIO_RGBA(1,1,1,0.06); }); }
+static UIColor *SIOBorder(void)        { return SIO_Dyn(^{ return SIO_RGBA(1,1,1,0.92); },
+                                                        ^{ return SIO_RGBA(1,1,1,0.22); }); }
+static UIColor *SIOBorderSoft(void)    { return SIO_Dyn(^{ return SIO_RGBA(0.16,0.30,0.25,0.10); },
+                                                        ^{ return SIO_RGBA(1,1,1,0.11); }); }
+static UIColor *SIOTextPri(void)       { return SIO_Dyn(^{ return SIO_RGBA(0.043,0.102,0.082,1.0); },
+                                                        ^{ return SIO_RGBA(0.933,0.965,0.953,1.0); }); }
+static UIColor *SIOTextSec(void)       { return SIO_Dyn(^{ return SIO_RGBA(0.353,0.420,0.396,1.0); },
+                                                        ^{ return SIO_RGBA(0.720,0.800,0.770,1.0); }); }
+static UIColor *SIOTextTer(void)       { return SIO_Dyn(^{ return SIO_RGBA(0.440,0.510,0.480,1.0); },
+                                                        ^{ return SIO_RGBA(0.560,0.630,0.610,1.0); }); }
+static UIColor *SIOAccentSoft(void)    { return SIO_Dyn(^{ return SIO_RGBA(0.039,0.502,0.349,0.13); },
+                                                        ^{ return SIO_RGBA(0.220,0.850,0.630,0.18); }); }
+static UIColor *SIOTrack(void)         { return SIO_Dyn(^{ return SIO_RGBA(0.10,0.20,0.17,0.10); },
+                                                        ^{ return SIO_RGBA(1,1,1,0.13); }); }
+static UIColor *SIOOnGlass(CGFloat a)  { return SIO_RGBA(1,1,1,a); }
+
+// 品牌色：祖母绿。浅色用深一点的保证对比度，深色提亮（与设计稿一致）
 static UIColor *SIOAccent(void) {
     if (@available(iOS 13.0, *)) {
         return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
@@ -533,27 +580,322 @@ static UIColor *SIOAccent(void) {
     return [UIColor colorWithRed:0.04 green:0.50 blue:0.36 alpha:1.0];
 }
 
+static UIFont *SIOFontCapped(CGFloat size, UIFontWeight weight, CGFloat cap) {
+    UIFont *base = [UIFont systemFontOfSize:size weight:weight];
+    UIFont *f = [[UIFontMetrics defaultMetrics] scaledFontForFont:base
+                                                 maximumPointSize:round(size * cap)];
+    return f ?: base;
+}
+static UIFont *SIOFont(CGFloat size, UIFontWeight weight) {
+    return SIOFontCapped(size, weight, 1.6);
+}
+
+// iOS 26 的 UIGlassEffect 只能在运行时探测：用旧 SDK 编译时符号不存在，
+// 直接写会编译不过，所以走 NSClassFromString + objc_msgSend。
+static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
+    Class cls = NSClassFromString(@"UIGlassEffect");
+    if (cls && [cls respondsToSelector:@selector(effectWithStyle:)]) {
+        id fx = ((id (*)(id, SEL, NSInteger))objc_msgSend)(cls, @selector(effectWithStyle:), 0);
+        if (fx) {
+            if (tint && [fx respondsToSelector:@selector(setTintColor:)]) {
+                [fx performSelector:@selector(setTintColor:) withObject:tint];
+            }
+            return (UIVisualEffect *)fx;
+        }
+    }
+    return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+}
+
+#pragma mark - 玻璃容器
+
+// 玻璃卡片：外层承载阴影（不裁切），内层 effectView 承载模糊 + tint + sheen，
+// 业务内容一律加进 contentView，跟着圆角一起裁切。
+@interface SIOGlassView : UIView
+@property (nonatomic, strong, readonly) UIView *contentView;
+@property (nonatomic, assign) CGFloat glassRadius;
+@property (nonatomic, assign) BOOL elevated;
+@property (nonatomic, strong) UIColor *glassTint;    // nil = 用 SIOSurface()
+- (instancetype)initWithRadius:(CGFloat)r;
+- (void)sio_applyTheme;
+@end
+
+@implementation SIOGlassView {
+    UIVisualEffectView *_effect;
+    UIView *_tint;
+    UIView *_sheen;
+    CAGradientLayer *_sheenLayer;
+}
+
+- (instancetype)initWithRadius:(CGFloat)r {
+    if ((self = [super initWithFrame:CGRectZero])) {
+        _glassRadius = r;
+        self.backgroundColor = [UIColor clearColor];
+        self.layer.cornerRadius = r;
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.layer.borderWidth = 1.0;
+        self.layer.shadowColor = SIO_RGBA(0.04,0.16,0.14,1.0).CGColor;
+        self.layer.shadowRadius = 18.0;
+        self.layer.shadowOffset = CGSizeMake(0, 10);
+        self.layer.shadowOpacity = 0.0;
+
+        _effect = [[UIVisualEffectView alloc] initWithEffect:nil];
+        _effect.translatesAutoresizingMaskIntoConstraints = NO;
+        _effect.clipsToBounds = YES;
+        _effect.layer.cornerRadius = r;
+        _effect.layer.cornerCurve = kCACornerCurveContinuous;
+        [self addSubview:_effect];
+
+        _tint = [[UIView alloc] initWithFrame:CGRectZero];
+        _tint.translatesAutoresizingMaskIntoConstraints = NO;
+        _tint.userInteractionEnabled = NO;
+        [_effect.contentView addSubview:_tint];
+
+        // 顶部高光：盖在 tint 之上、内容之下
+        _sheen = [[UIView alloc] initWithFrame:CGRectZero];
+        _sheen.userInteractionEnabled = NO;
+        _sheen.translatesAutoresizingMaskIntoConstraints = NO;
+        _sheenLayer = [CAGradientLayer layer];
+        _sheenLayer.colors = @[ (id)SIOOnGlass(0.55).CGColor, (id)SIOOnGlass(0.0).CGColor ];
+        _sheenLayer.startPoint = CGPointMake(0.5, 0.0);
+        _sheenLayer.endPoint = CGPointMake(0.5, 1.0);
+        [_sheen.layer addSublayer:_sheenLayer];
+        [_effect.contentView addSubview:_sheen];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [_effect.topAnchor constraintEqualToAnchor:self.topAnchor],
+            [_effect.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+            [_effect.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+            [_effect.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+            [_tint.topAnchor constraintEqualToAnchor:_effect.contentView.topAnchor],
+            [_tint.bottomAnchor constraintEqualToAnchor:_effect.contentView.bottomAnchor],
+            [_tint.leadingAnchor constraintEqualToAnchor:_effect.contentView.leadingAnchor],
+            [_tint.trailingAnchor constraintEqualToAnchor:_effect.contentView.trailingAnchor],
+            [_sheen.topAnchor constraintEqualToAnchor:_effect.contentView.topAnchor],
+            [_sheen.leadingAnchor constraintEqualToAnchor:_effect.contentView.leadingAnchor],
+            [_sheen.trailingAnchor constraintEqualToAnchor:_effect.contentView.trailingAnchor],
+            [_sheen.heightAnchor constraintEqualToAnchor:_effect.contentView.heightAnchor multiplier:0.55],
+        ]];
+
+        [self sio_applyTheme];
+    }
+    return self;
+}
+
+- (UIView *)contentView { return _effect.contentView; }
+
+- (void)sio_applyTheme {
+    BOOL dark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    BOOL systemGlass = (NSClassFromString(@"UIGlassEffect") != nil);
+    _effect.effect = SIOGlassEffect(nil);
+    _tint.backgroundColor = self.glassTint ?: (systemGlass ? SIOSurfaceGlass26() : SIOSurface());
+    self.layer.borderColor = SIOBorder().CGColor;
+    self.layer.shadowOpacity = self.elevated ? (dark ? 0.42f : 0.10f) : 0.0f;
+    self.layer.shadowColor = (dark ? [UIColor blackColor]
+                                   : SIO_RGBA(0.04,0.16,0.14,1.0)).CGColor;
+    _sheen.alpha = dark ? 0.55 : 1.0;
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    [super traitCollectionDidChange:previous];
+    if (@available(iOS 13.0, *)) {
+        if (!previous || previous.userInterfaceStyle == self.traitCollection.userInterfaceStyle) return;
+    }
+    [self sio_applyTheme];
+}
+
+// 视图刚进层级时 traitCollection 还是 unspecified，必须补一次，
+// 否则深色模式下第一屏会闪一下浅色描边。
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [self sio_applyTheme];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    self.layer.cornerRadius = _glassRadius;
+    _effect.layer.cornerRadius = _glassRadius;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _sheenLayer.frame = CGRectMake(0, 0, _sheen.bounds.size.width, _sheen.bounds.size.height);
+    [CATransaction commit];
+}
+@end
+
+#pragma mark - 玻璃按钮（轻量：不叠模糊，只做半透明色 + 描边 + 按压反馈）
+
+@interface SIOGlassButton : UIButton
+@property (nonatomic, assign) CGFloat glassRadius;
+@property (nonatomic, strong) UIColor *glassFill;
+@property (nonatomic, strong) UIColor *rimColor;
+@property (nonatomic, assign) CGFloat pressScale;
+- (instancetype)initWithRadius:(CGFloat)r;
+- (void)sio_applyTheme;
+@end
+
+@implementation SIOGlassButton
+
+- (instancetype)initWithRadius:(CGFloat)r {
+    if ((self = [super initWithFrame:CGRectZero])) {
+        _glassRadius = r;
+        _pressScale = 0.975;
+        self.layer.cornerRadius = r;
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.layer.borderWidth = 1.0;
+        self.backgroundColor = SIOSurface();
+        [self sio_applyTheme];
+    }
+    return self;
+}
+
+- (void)sio_applyTheme {
+    BOOL dark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    self.backgroundColor = self.glassFill ?: SIOSurface();
+    self.layer.borderColor = (self.rimColor ?: SIOBorder()).CGColor;
+    self.layer.cornerRadius = _glassRadius;
+    self.layer.shadowColor = (dark ? [UIColor blackColor] : SIO_RGBA(0.04,0.16,0.14,1.0)).CGColor;
+    self.layer.shadowOpacity = dark ? 0.34f : 0.08f;
+    self.layer.shadowRadius = 14.0;
+    self.layer.shadowOffset = CGSizeMake(0, 6);
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    [super traitCollectionDidChange:previous];
+    if (@available(iOS 13.0, *)) {
+        if (!previous || previous.userInterfaceStyle == self.traitCollection.userInterfaceStyle) return;
+    }
+    [self sio_applyTheme];
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [self sio_applyTheme];
+}
+
+// 动态透明反馈：按下缩一点 + 略透，松手回弹（不改变布局尺寸）
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    CGFloat s = highlighted ? self.pressScale : 1.0;
+    CGFloat a = highlighted ? 0.92 : 1.0;
+    [UIView animateWithDuration:(highlighted ? 0.12 : 0.18)
+                          delay:0
+                        options:(UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction |
+                                 UIViewAnimationOptionCurveEaseOut)
+                     animations:^{
+        self.transform = CGAffineTransformMakeScale(s, s);
+        self.alpha = a;
+    } completion:nil];
+}
+@end
+
+#pragma mark - 环境光斑背景
+
+// 三团径向渐变，代替「一块死色背景」。CAGradientLayer 的 radial 类型比实时模糊便宜得多。
+@interface SIOAmbientView : UIView
+@end
+
+@implementation SIOAmbientView {
+    CAGradientLayer *_a, *_b, *_c;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.userInteractionEnabled = NO;
+        self.backgroundColor = SIOBG();
+        _a = [self sio_blob];
+        _b = [self sio_blob];
+        _c = [self sio_blob];
+        [self.layer addSublayer:_a];
+        [self.layer addSublayer:_b];
+        [self.layer addSublayer:_c];
+        [self sio_applyTheme];
+    }
+    return self;
+}
+
+- (CAGradientLayer *)sio_blob {
+    CAGradientLayer *l = [CAGradientLayer layer];
+    l.type = kCAGradientLayerRadial;
+    l.startPoint = CGPointMake(0.5, 0.5);
+    l.endPoint = CGPointMake(1.0, 1.0);
+    return l;
+}
+
+- (void)sio_applyTheme {
+    BOOL dark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    self.backgroundColor = SIOBG();
+    UIColor *emerald = dark ? SIO_RGBA(0.16,0.78,0.58,0.34) : SIO_RGBA(0.24,0.83,0.63,0.42);
+    UIColor *sky     = dark ? SIO_RGBA(0.22,0.58,0.90,0.26) : SIO_RGBA(0.32,0.62,0.95,0.32);
+    UIColor *lime    = dark ? SIO_RGBA(0.74,0.84,0.38,0.19) : SIO_RGBA(0.85,0.92,0.45,0.30);
+    for (CAGradientLayer *l in @[ _a, _b, _c ]) {
+        l.colors = @[ (id)((l == _a) ? emerald : (l == _b) ? sky : lime).CGColor,
+                      (id)[UIColor clearColor].CGColor ];
+        l.locations = @[ @0.0, @1.0 ];
+    }
+    [self setNeedsLayout];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    [super traitCollectionDidChange:previous];
+    if (@available(iOS 13.0, *)) {
+        if (!previous || previous.userInterfaceStyle == self.traitCollection.userInterfaceStyle) return;
+    }
+    [self sio_applyTheme];
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [self sio_applyTheme];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGRect b = self.bounds;
+    CGFloat w = b.size.width, h = b.size.height;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _a.frame = CGRectMake(-w * 0.42, -h * 0.18, w * 1.10, w * 1.10);
+    _b.frame = CGRectMake(w * 0.42, h * 0.28, w * 1.00, w * 1.00);
+    _c.frame = CGRectMake(-w * 0.40, h * 0.66, w * 0.95, w * 0.95);
+    [CATransaction commit];
+}
+@end
+
+#pragma mark - 控件工厂
+
+// v2.5.1：横向抗压缩统一降到 749（低于 stack 宽度约束的 999）。
+// 不降的话，任何 intrinsic 宽度超屏的控件都会把整列撑宽 —— 分段控件是最典型的那个：
+// 系统按内容算 intrinsic，三段中文就能顶到 400pt 以上，卡片跟着溢出屏幕。
+static void SIOLoosenWidth(UIView *v) {
+    if (!v) return;
+    [v setContentCompressionResistancePriority:(UILayoutPriority)(UILayoutPriorityRequired - 251)
+                                       forAxis:UILayoutConstraintAxisHorizontal];
+    // 系统控件（分段 / 开关 / 输入框）内部一律不碰 —— 它们靠 required 约束自洽，
+    // 强行降级会把内部排布搞散。
+    if ([v isKindOfClass:[UIControl class]]) return;
+    for (UIView *s in v.subviews) SIOLoosenWidth(s);
+}
+
 static UILabel *SIOLabel(NSString *t, CGFloat size, UIColor *color) {
     UILabel *l = [[UILabel alloc] init];
     l.text = t;
-    // v2.1.20：走 Dynamic Type（调用方若要覆盖字体，请同样用 SIOFont/SIOFontCapped）
+    // v2.1.20：走 Dynamic Type，上限 1.6×
     l.font = SIOFont(size, UIFontWeightRegular);
     l.adjustsFontForContentSizeCategory = YES;
-    l.textColor = color ?: [UIColor labelColor];
+    l.textColor = color ?: SIOTextPri();
     l.numberOfLines = 0;
     return l;
 }
 
-// 带副标题的开关行：主标题 16pt + 12pt 灰色说明，右侧控件。
-// 副标题让「这个开关到底动什么」一目了然，不再靠长标题硬塞。
+// 带副标题的开关行：主标题 16pt + 12pt 灰色说明，右侧控件
 static UIView *SIORowSub(NSString *title, NSString *subtitle, UIView *ctrl) {
-    UILabel *l = SIOLabel(title, 16, [UIColor labelColor]);
+    UILabel *l = SIOLabel(title, 16, SIOTextPri());
     l.font = SIOFont(16, UIFontWeightMedium);
     UIStackView *v = [[UIStackView alloc] initWithArrangedSubviews:@[ l ]];
     v.axis = UILayoutConstraintAxisVertical;
     v.spacing = 2;
     if (subtitle.length) {
-        UILabel *s = SIOLabel(subtitle, 12, [UIColor secondaryLabelColor]);
+        UILabel *s = SIOLabel(subtitle, 12, SIOTextSec());
         [v addArrangedSubview:s];
     }
     [v setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
@@ -576,203 +918,274 @@ static UIView *SIORow(NSString *title, UIView *ctrl, UIColor *titleColor) {
     return h;
 }
 
+// 玻璃卡片：26 连续圆角 + 背景模糊 + 顶部高光 + 1px 描边 + 双层阴影
 static UIView *SIOCard(NSArray<UIView *> *items, CGFloat spacing) {
-    UIView *card = [[UIView alloc] init];
-    card.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    // v2.1.20（HIG）：分组卡片去掉描边 + 阴影，改用「同色卡片 + 背景层级差」的扁平语言。
-    // 顺带修掉一个深色模式隐患：borderColor 存的是 CGColor 快照，
-    // 系统切换浅/深色时 UIColor.separatorColor 会变，但 CGColor 不会 —— 描边会停在旧色。
-    // 不画描边，就不存在这个状态。
-    card.layer.cornerRadius = 16;
-    if (@available(iOS 13.0, *)) card.layer.cornerCurve = kCACornerCurveContinuous;
+    SIOGlassView *card = [[SIOGlassView alloc] initWithRadius:26.0];
+    card.elevated = YES;
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:items];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = spacing;
     st.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:st];
-
+    [card.contentView addSubview:st];
     [NSLayoutConstraint activateConstraints:@[
-        [st.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
-        [st.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
-        [st.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [st.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [st.topAnchor constraintEqualToAnchor:card.contentView.topAnchor constant:16],
+        [st.bottomAnchor constraintEqualToAnchor:card.contentView.bottomAnchor constant:-16],
+        [st.leadingAnchor constraintEqualToAnchor:card.contentView.leadingAnchor constant:16],
+        [st.trailingAnchor constraintEqualToAnchor:card.contentView.trailingAnchor constant:-16],
     ]];
     return card;
 }
 
+// 玻璃胶囊按钮：调用方传的实心色在这里换算成 16% 的 tinted glass，
+// 白色背景则视为「描边款」——保持品牌色只出现在文字与描边上。
 static UIButton *SIOPill(NSString *title, UIColor *bg, UIColor *fg) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    SIOGlassButton *b = [[SIOGlassButton alloc] initWithRadius:14.0];
     [b setTitle:title forState:UIControlStateNormal];
     b.titleLabel.font = SIOFont(15, UIFontWeightSemibold);
     b.titleLabel.adjustsFontForContentSizeCategory = YES;
     b.titleLabel.adjustsFontSizeToFitWidth = YES;
     b.titleLabel.minimumScaleFactor = 0.8;
-    b.backgroundColor = bg;
-    [b setTitleColor:fg forState:UIControlStateNormal];
-    b.layer.cornerRadius = 12;
-    if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
-    b.layer.masksToBounds = YES;
-    // v2.1.20（HIG）：最小高度取 Apple 建议的 44pt 点击区，且用 >= 而非 = ——
-    // 文字放大时按钮跟着长高，而不是把标题裁掉。
+
+    CGFloat r = 1, g = 1, bl = 1, a = 1;
+    BOOL parsed = (bg != nil) && [bg getRed:&r green:&g blue:&bl alpha:&a];
+    BOOL whiteish = (!parsed) || (a > 0.85 && r > 0.94 && g > 0.94 && bl > 0.94);
+
+    UIColor *textColor;
+    if (whiteish) {
+        b.glassFill = SIOSurfaceStrong();
+        textColor   = fg ?: SIOAccent();
+        // 浅色发丝描边跟着文字色走：这批按钮原本是「白底 + 彩字 + 彩描边」，
+        // 去掉实心色后语义只能靠这一点描边保住了。
+        b.rimColor  = [textColor colorWithAlphaComponent:0.26];
+    } else {
+        b.glassFill = [bg colorWithAlphaComponent:0.16];
+        b.rimColor  = [bg colorWithAlphaComponent:0.30];
+        textColor   = bg;
+    }
+    [b sio_applyTheme];
+    [b setTitleColor:textColor forState:UIControlStateNormal];
+    [b setTitleColor:[textColor colorWithAlphaComponent:0.65] forState:UIControlStateHighlighted];
     [b.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
     return b;
 }
 
-// v2.1.20（HIG）：预设按钮的图标由 emoji 换成 SF Symbols。
-// emoji 的字形/基线/颜色不受控（不同系统版本胖瘦不一），苹果自家界面从不拿它当图标；
-// SF Symbols 会自带基线对齐、跟随 tintColor 与 Dynamic Type。
+// 预设块：SF Symbols 图标 + 标题，整块是可点击的玻璃元件
 static UIButton *SIOPresetButton(NSString *symbol, NSString *title, UIColor *tint) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    // 苹果 iOS 15 之后主推的「tinted fill」：同色 14% 底 + 同色图标，比描边按钮更轻
-    b.backgroundColor = [tint colorWithAlphaComponent:0.14];
-    b.layer.cornerRadius = 14;
-    if (@available(iOS 13.0, *)) b.layer.cornerCurve = kCACornerCurveContinuous;
+    SIOGlassButton *b = [[SIOGlassButton alloc] initWithRadius:22.0];
+    b.glassFill = SIOSurface();
+    b.rimColor  = SIOBorder();
+
+    UIView *tile = [[UIView alloc] init];
+    tile.translatesAutoresizingMaskIntoConstraints = NO;
+    tile.backgroundColor = [tint colorWithAlphaComponent:0.16];
+    tile.layer.cornerRadius = 10.0;
+    tile.layer.cornerCurve = kCACornerCurveContinuous;
+    tile.userInteractionEnabled = NO;
 
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
-        configurationWithPointSize:22 weight:UIImageSymbolWeightSemibold];
-    UIImage *img = [[UIImage systemImageNamed:symbol] imageWithConfiguration:cfg];
-    UIImageView *icon = [[UIImageView alloc] initWithImage:img];
+        configurationWithPointSize:20 weight:UIImageSymbolWeightSemibold];
+    UIImageView *icon = [[UIImageView alloc] initWithImage:
+                         [[UIImage systemImageNamed:symbol] imageWithConfiguration:cfg]];
     icon.contentMode = UIViewContentModeScaleAspectFit;
     icon.tintColor = tint;
     icon.translatesAutoresizingMaskIntoConstraints = NO;
+    [tile addSubview:icon];
 
-    UILabel *t = SIOLabel(title, 13, [UIColor labelColor]);
+    UILabel *t = SIOLabel(title, 13, SIOTextPri());
     t.font = SIOFontCapped(13, UIFontWeightSemibold, 1.35);
     t.textAlignment = NSTextAlignmentCenter;
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ icon, t ]];
+
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[ tile, t ]];
     st.axis = UILayoutConstraintAxisVertical;
     st.alignment = UIStackViewAlignmentCenter;
-    st.spacing = 6;
+    st.spacing = 7;
     st.userInteractionEnabled = NO;
     st.translatesAutoresizingMaskIntoConstraints = NO;
     [b addSubview:st];
+
     [NSLayoutConstraint activateConstraints:@[
+        [tile.widthAnchor constraintEqualToConstant:30],
+        [tile.heightAnchor constraintEqualToConstant:30],
+        [icon.centerXAnchor constraintEqualToAnchor:tile.centerXAnchor],
+        [icon.centerYAnchor constraintEqualToAnchor:tile.centerYAnchor],
+        [icon.widthAnchor constraintEqualToConstant:18],
+        [icon.heightAnchor constraintEqualToConstant:18],
         [st.centerXAnchor constraintEqualToAnchor:b.centerXAnchor],
         [st.centerYAnchor constraintEqualToAnchor:b.centerYAnchor],
-        [st.topAnchor constraintGreaterThanOrEqualToAnchor:b.topAnchor constant:10],
-        [st.bottomAnchor constraintLessThanOrEqualToAnchor:b.bottomAnchor constant:-10],
-        [st.leadingAnchor constraintGreaterThanOrEqualToAnchor:b.leadingAnchor constant:4],
-        [st.trailingAnchor constraintLessThanOrEqualToAnchor:b.trailingAnchor constant:-4],
+        [st.topAnchor constraintGreaterThanOrEqualToAnchor:b.topAnchor constant:11],
+        [st.bottomAnchor constraintLessThanOrEqualToAnchor:b.bottomAnchor constant:-11],
+        [st.leadingAnchor constraintGreaterThanOrEqualToAnchor:b.leadingAnchor constant:6],
+        [st.trailingAnchor constraintLessThanOrEqualToAnchor:b.trailingAnchor constant:-6],
     ]];
-    [b.heightAnchor constraintGreaterThanOrEqualToConstant:72].active = YES;
+    [b.heightAnchor constraintGreaterThanOrEqualToConstant:80].active = YES;
     return b;
 }
 
-// v2.1.20（HIG）：分组标题改为 13pt Semibold + 句式大小写（不再全大写）。
-// 全大写是 iOS 6 时代的分组标题写法，iOS 13 之后系统应用统一回到句式大小写。
+// 分组标题：13pt Semibold + 句式大小写
 static UILabel *SIOSectionTitle(NSString *t) {
     UILabel *l = [[UILabel alloc] init];
     l.text = t;
     l.font = SIOFont(13, UIFontWeightSemibold);
     l.adjustsFontForContentSizeCategory = YES;
-    l.textColor = [UIColor secondaryLabelColor];
+    l.textColor = SIOTextSec();
     l.numberOfLines = 0;
     return l;
 }
 
-// v2.1.20（HIG）：多行输入框统一外观。
-//   · 底用 secondarySystemGroupedBackground（与卡片同级），描边 0.5pt separator
-//   · continuous 连续曲率圆角
-//   · 最小高度而非固定高度 —— 大字号下不裁字
-// 注意：layer.borderColor 存的是 CGColor 快照，不会跟随浅/深色切换，
-// 由 SIOPageVC 在 traitCollectionDidChange 里统一重刷。
+// 多行输入框：玻璃卡内用半透明面 + 柔和描边（描边在页面 trait 变化时统一重刷）
 static UITextView *SIOFieldTextView(CGFloat minHeight) {
     UITextView *tv = [[UITextView alloc] init];
     tv.font = SIOFont(15, UIFontWeightRegular);
     tv.adjustsFontForContentSizeCategory = YES;
-    tv.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    tv.backgroundColor = SIOSurfaceStrong();
+    tv.textColor = SIOTextPri();
     tv.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
-    tv.layer.cornerRadius = 12;
+    tv.layer.cornerRadius = 14;
     if (@available(iOS 13.0, *)) tv.layer.cornerCurve = kCACornerCurveContinuous;
-    tv.layer.borderWidth = 0.5;
-    tv.layer.borderColor = [UIColor separatorColor].CGColor;
+    tv.layer.borderWidth = 1;
+    tv.layer.borderColor = SIOBorderSoft().CGColor;
     [tv.heightAnchor constraintGreaterThanOrEqualToConstant:minHeight].active = YES;
     return tv;
 }
 
-// 渐变头部（CAGradientLayer 子层；QuartzCore 在 App 链接框架内，避免裸 CoreGraphics 符号）
+// 分段控件：iOS 26 起系统分段本身就是玻璃质感，直接沿用系统外形，只改选中块与文字色。
+// 注意不要试图改 backgroundColor —— 系统会用内部的 backgroundView 盖掉，
+// 一旦设了反而在浅色下多出一圈生硬的圆角色块。
+static void SIOStyleSegmented(UISegmentedControl *seg) {
+    if (!seg) return;
+    // 等分分配，绝不让内容决定宽度（这是溢出的源头）
+    seg.apportionsSegmentWidthsByContent = NO;
+    [seg setContentCompressionResistancePriority:(UILayoutPriority)(UILayoutPriorityRequired - 251)
+                                         forAxis:UILayoutConstraintAxisHorizontal];
+    if (@available(iOS 13.0, *)) seg.selectedSegmentTintColor = SIOSurfaceStrong();
+    [seg setTitleTextAttributes:@{ NSForegroundColorAttributeName: SIOTextSec(),
+                                   NSFontAttributeName: SIOFont(13, UIFontWeightMedium) }
+                       forState:UIControlStateNormal];
+    [seg setTitleTextAttributes:@{ NSForegroundColorAttributeName: SIOTextPri(),
+                                   NSFontAttributeName: SIOFont(13, UIFontWeightSemibold) }
+                       forState:UIControlStateSelected];
+}
+
+#pragma mark - 顶部品牌头（渐变玻璃卡）
+
 @interface SIOGradientHeader : UIView {
     CAGradientLayer *_grad;
+    CAGradientLayer *_sheen;
 }
 - (void)setStatusText:(NSString *)s;
 @end
+
 @implementation SIOGradientHeader
+
 - (instancetype)initWithFrame:(CGRect)frame {
     if ((self = [super initWithFrame:frame])) {
-        self.layer.cornerRadius = 22;
+        self.layer.cornerRadius = 28;
         if (@available(iOS 13.0, *)) self.layer.cornerCurve = kCACornerCurveContinuous;
-        self.layer.masksToBounds = YES;
+        self.layer.masksToBounds = NO;
+        self.layer.borderWidth = 1.0;
+        self.layer.borderColor = SIOOnGlass(0.20).CGColor;
+        self.layer.shadowColor = SIO_RGBA(0.02,0.12,0.10,1.0).CGColor;
+        self.layer.shadowOffset = CGSizeMake(0, 16);
+        self.layer.shadowRadius = 30;
+        self.layer.shadowOpacity = 0.26;
+
+        // 渐变层放在一个裁切容器里，圆角才不会漏角
+        UIView *clip = [[UIView alloc] init];
+        clip.translatesAutoresizingMaskIntoConstraints = NO;
+        clip.layer.cornerRadius = 28;
+        if (@available(iOS 13.0, *)) clip.layer.cornerCurve = kCACornerCurveContinuous;
+        clip.layer.masksToBounds = YES;
+        clip.userInteractionEnabled = NO;
+        [self addSubview:clip];
+
         _grad = [CAGradientLayer layer];
-        // v2.1.0：三档渐变（祖母绿 → 孔雀蓝 → 深夜蓝），比原来的两段更有层次
-        _grad.colors = @[
-            (id)[UIColor colorWithRed:0.06 green:0.62 blue:0.47 alpha:1.0].CGColor,
-            (id)[UIColor colorWithRed:0.05 green:0.36 blue:0.52 alpha:1.0].CGColor,
-            (id)[UIColor colorWithRed:0.03 green:0.09 blue:0.20 alpha:1.0].CGColor,
-        ];
-        _grad.locations = @[ @0.0, @0.55, @1.0 ];
         _grad.startPoint = CGPointMake(0, 0);
         _grad.endPoint = CGPointMake(1, 1);
-        [self.layer insertSublayer:_grad atIndex:0];
+        [clip.layer addSublayer:_grad];
+
+        // 顶部反射高光
+        _sheen = [CAGradientLayer layer];
+        _sheen.colors = @[ (id)SIOOnGlass(0.22).CGColor, (id)SIOOnGlass(0.0).CGColor ];
+        _sheen.startPoint = CGPointMake(0.5, 0.0);
+        _sheen.endPoint = CGPointMake(0.5, 1.0);
+        [clip.layer addSublayer:_sheen];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [clip.topAnchor constraintEqualToAnchor:self.topAnchor],
+            [clip.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+            [clip.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+            [clip.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+        ]];
 
         // 右上角版本徽章
-        // v2.1.20：头部走 Dynamic Type，但缩放上限收到 1.3× —— 头部高度是固定 132pt
-        // （底部锚定的 4 层文字 + 右侧头像），放到 1.6× 会与固定高度打架。
-        UILabel *badge = SIOLabel(SIO_VERSION, 11, [UIColor whiteColor]);
+        UILabel *badge = SIOLabel(SIO_VERSION, 11, SIOOnGlass(1.0));
         badge.font = SIOFontCapped(11, UIFontWeightBold, 1.3);
         badge.textAlignment = NSTextAlignmentCenter;
-        badge.backgroundColor = [UIColor colorWithWhite:1 alpha:0.18];
-        badge.layer.cornerRadius = 9;
+        badge.backgroundColor = SIOOnGlass(0.18);
+        badge.layer.cornerRadius = 11;
         badge.layer.masksToBounds = YES;
+        badge.layer.borderWidth = 1;
+        badge.layer.borderColor = SIOOnGlass(0.22).CGColor;
         badge.translatesAutoresizingMaskIntoConstraints = NO;
 
-        UILabel *t = SIOLabel(@"隔壁老王 · 王灿专用", 23, [UIColor whiteColor]);
-        t.font = SIOFontCapped(23, UIFontWeightBold, 1.3);
-        UILabel *s = SIOLabel(@"极速IOS · 动画加速超强版", 12,
-                              [UIColor colorWithWhite:1 alpha:0.72]);
-        s.font = SIOFontCapped(12, UIFontWeightRegular, 1.3);
-        UILabel *st2 = SIOLabel(@"等待读取…", 13, [UIColor whiteColor]);
+        UILabel *t = SIOLabel(@"隔壁老王 · 王灿专用", 21, SIOOnGlass(1.0));
+        t.font = SIOFontCapped(21, UIFontWeightBold, 1.3);
+        UILabel *s = SIOLabel(@"极速IOS · 动画加速超强版", 11.5, SIOOnGlass(0.72));
+        s.font = SIOFontCapped(11.5, UIFontWeightRegular, 1.3);
+
+        // 状态行：左侧加一个发光绿点，比纯文字更能一眼看出「在跑」
+        UIView *dot = [[UIView alloc] init];
+        dot.translatesAutoresizingMaskIntoConstraints = NO;
+        dot.backgroundColor = SIO_RGBA(0.36,0.94,0.71,1.0);
+        dot.layer.cornerRadius = 3.5;
+        dot.layer.shadowColor = SIO_RGBA(0.36,0.94,0.71,0.9).CGColor;
+        dot.layer.shadowOpacity = 1.0;
+        dot.layer.shadowRadius = 6;
+        dot.layer.shadowOffset = CGSizeZero;
+
+        UILabel *st2 = SIOLabel(@"等待读取…", 12.5, SIOOnGlass(1.0));
         st2.tag = 99;
-        st2.font = SIOFontCapped(13, UIFontWeightSemibold, 1.3);
-        // v2.1.9：状态行允许两行 —— 一行塞不下全部状态，之前直接顶到头像底下被遮挡
+        st2.font = SIOFontCapped(12.5, UIFontWeightSemibold, 1.3);
         st2.numberOfLines = 2;
 
-        for (UIView *v in @[ badge, t, s, st2 ]) {
+        for (UIView *v in @[ badge, t, s, st2, dot ]) {
             if (v != badge) v.translatesAutoresizingMaskIntoConstraints = NO;
             [self addSubview:v];
         }
         [NSLayoutConstraint activateConstraints:@[
-            [badge.topAnchor constraintEqualToAnchor:self.topAnchor constant:14],
+            [badge.topAnchor constraintEqualToAnchor:self.topAnchor constant:16],
             [badge.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-            [badge.widthAnchor constraintGreaterThanOrEqualToConstant:58],
-            // v2.1.20：>= 而非 = —— 大字号下版本号不被 22pt 高的徽章裁掉
-            [badge.heightAnchor constraintGreaterThanOrEqualToConstant:22],
+            [badge.widthAnchor constraintGreaterThanOrEqualToConstant:62],
+            [badge.heightAnchor constraintGreaterThanOrEqualToConstant:24],
 
             [s.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:18],
-            [s.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
-            [st2.leadingAnchor constraintEqualToAnchor:s.leadingAnchor],
+            [s.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-16],
             [st2.bottomAnchor constraintEqualToAnchor:s.topAnchor constant:-6],
+            [dot.widthAnchor constraintEqualToConstant:7],
+            [dot.heightAnchor constraintEqualToConstant:7],
+            [dot.centerYAnchor constraintEqualToAnchor:st2.centerYAnchor],
+            [st2.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:31],
+            [dot.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:18],
+
             [t.leadingAnchor constraintEqualToAnchor:s.leadingAnchor],
-            [t.bottomAnchor constraintEqualToAnchor:st2.topAnchor constant:-4],
-            [t.trailingAnchor constraintLessThanOrEqualToAnchor:badge.leadingAnchor constant:-8],
+            [t.bottomAnchor constraintEqualToAnchor:st2.topAnchor constant:-6],
+            [t.trailingAnchor constraintLessThanOrEqualToAnchor:badge.leadingAnchor constant:-10],
         ]];
 
-        // v2.1.9：右上角主人头像（打包资源 Owner.jpg；缺资源时自动隐藏，不影响构建）
-        // v2.1.9 修复启动崩溃：头像约束引用了 badge，而原代码在 badge 入层级之前就激活，
-        // 触发 NSLayoutConstraintIsPotentiallyDanglyInContainer → SIGABRT（启动 37ms 即崩）。
-        // 现在统一挪到所有子视图 addSubview 与主约束激活之后。
+        // 右上角主人头像（打包资源 Owner.jpg；缺资源自动隐藏）
         UIImage *ownerImg = [UIImage imageWithContentsOfFile:
                              [[NSBundle mainBundle] pathForResource:@"Owner" ofType:@"jpg"]];
         if (ownerImg) {
             UIImageView *av = [[UIImageView alloc] initWithImage:ownerImg];
             av.contentMode = UIViewContentModeScaleAspectFill;
             av.clipsToBounds = YES;
-            av.layer.cornerRadius = 31;
+            av.layer.cornerRadius = 30;
             av.layer.masksToBounds = YES;
             av.layer.borderWidth = 2;
-            av.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.85].CGColor;
+            av.layer.borderColor = SIOOnGlass(0.85).CGColor;
             av.translatesAutoresizingMaskIntoConstraints = NO;
 
-            UILabel *cap = SIOLabel(@"👑 主人", 10, [UIColor colorWithWhite:1 alpha:0.9]);
+            UILabel *cap = SIOLabel(@"主人", 10, SIOOnGlass(0.9));
             cap.font = SIOFontCapped(10, UIFontWeightSemibold, 1.3);
             cap.textAlignment = NSTextAlignmentCenter;
             cap.translatesAutoresizingMaskIntoConstraints = NO;
@@ -782,15 +1195,11 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
             [NSLayoutConstraint activateConstraints:@[
                 [av.topAnchor constraintEqualToAnchor:badge.bottomAnchor constant:10],
                 [av.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-                [av.widthAnchor constraintEqualToConstant:62],
-                [av.heightAnchor constraintEqualToConstant:62],
-
+                [av.widthAnchor constraintEqualToConstant:60],
+                [av.heightAnchor constraintEqualToConstant:60],
                 [cap.topAnchor constraintEqualToAnchor:av.bottomAnchor constant:3],
                 [cap.centerXAnchor constraintEqualToAnchor:av.centerXAnchor],
                 [cap.widthAnchor constraintEqualToConstant:70],
-
-                // v2.1.9：文字区让出右侧头像列 —— 标题/状态/副标题都不得越过头像左缘，
-                // 修复状态行钻到头像底下被遮挡的问题
                 [t.trailingAnchor constraintLessThanOrEqualToAnchor:av.leadingAnchor constant:-10],
                 [st2.trailingAnchor constraintLessThanOrEqualToAnchor:av.leadingAnchor constant:-10],
                 [s.trailingAnchor constraintLessThanOrEqualToAnchor:av.leadingAnchor constant:-10],
@@ -799,13 +1208,43 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     }
     return self;
 }
+
+- (void)sio_applyTheme {
+    BOOL dark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    _grad.colors = @[
+        (id)(dark ? SIO_RGBA(0.09,0.55,0.42,1.0) : SIO_RGBA(0.055,0.60,0.45,1.0)).CGColor,
+        (id)(dark ? SIO_RGBA(0.05,0.28,0.42,1.0) : SIO_RGBA(0.055,0.36,0.52,1.0)).CGColor,
+        (id)(dark ? SIO_RGBA(0.02,0.06,0.13,1.0) : SIO_RGBA(0.03,0.09,0.20,1.0)).CGColor,
+    ];
+    _grad.locations = @[ @0.0, @0.55, @1.0 ];
+    self.layer.shadowOpacity = dark ? 0.42f : 0.26f;
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    [super traitCollectionDidChange:previous];
+    if (@available(iOS 13.0, *)) {
+        if (!previous || previous.userInterfaceStyle == self.traitCollection.userInterfaceStyle) return;
+    }
+    [self sio_applyTheme];
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [self sio_applyTheme];
+}
+
 - (void)setStatusText:(NSString *)s {
     for (UIView *v in self.subviews)
         if (v.tag == 99 && [v isKindOfClass:[UILabel class]]) ((UILabel *)v).text = s;
 }
+
 - (void)layoutSubviews {
     [super layoutSubviews];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     _grad.frame = self.bounds;
+    _sheen.frame = CGRectMake(0, 0, self.bounds.size.width, self.bounds.size.height * 0.55);
+    [CATransaction commit];
 }
 @end
 
@@ -1038,10 +1477,10 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
         self.ovGuard.textColor = [UIColor systemOrangeColor];
     } else if (mine) {
         self.ovGuard.text = [NSString stringWithFormat:@"已存在 %@ 的专属配置，改完点右上角「保存」生效。", bid];
-        self.ovGuard.textColor = [UIColor secondaryLabelColor];
+        self.ovGuard.textColor = SIOTextSec();
     } else {
         self.ovGuard.text = [NSString stringWithFormat:@"%@ 暂无专属配置；打开开关并保存即可创建。", bid];
-        self.ovGuard.textColor = [UIColor secondaryLabelColor];
+        self.ovGuard.textColor = SIOTextSec();
     }
     // v2.1.9：多 ID 时追加批量提示
     if (ids.count > 1) {
@@ -1797,6 +2236,7 @@ static void SIOCheckRange(NSMutableArray *problems, NSDictionary *d, NSString *k
 @property (strong) UIStackView *stack;
 @property (strong) UIScrollView *scroll;        // v2.1.20：键盘避让要用
 @property (strong) UIBarButtonItem *saveItem;   // v2.1.20：未保存标记
+@property (strong) SIOGlassButton *saveButton;    // v2.5.0：自定义视图的标题要单独改
 - (void)buildContent;      // 子类重写
 - (void)uiApplied;         // 子类重写（预设/导入后刷新）
 - (void)saveTapped;
@@ -1815,11 +2255,16 @@ static BOOL gUIDirty = NO;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    // v2.5.0：环境光斑底（三团径向渐变）替代系统分组灰；玻璃卡片靠它产生折射感
+    self.view.backgroundColor = SIOBG();
+    SIOAmbientView *ambient = [[SIOAmbientView alloc] initWithFrame:self.view.bounds];
+    ambient.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:ambient];
 
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
     scroll.alwaysBounceVertical = YES;
+    scroll.showsVerticalScrollIndicator = YES;
     // v2.1.20（HIG）：下拉即收键盘，不再要求用户满屏找空白处点
     scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
     [self.view addSubview:scroll];
@@ -1827,30 +2272,58 @@ static BOOL gUIDirty = NO;
 
     self.stack = [[UIStackView alloc] init];
     self.stack.axis = UILayoutConstraintAxisVertical;
-    self.stack.spacing = 14;
+    self.stack.spacing = 16;   // 玻璃卡之间留呼吸，14 在毛玻璃上会糊成一片
     self.stack.translatesAutoresizingMaskIntoConstraints = NO;
     [scroll addSubview:self.stack];
+
+    // v2.5.1 响应式：内容最大宽度 720 并居中 —— iPad / 横屏 / 桌面壳里不会拉成一行长条，
+    // 手机上等同「左右各 20」。
+    //
+    // ⚠ 这里必须是 999，不能是 750。v2.5.0 用了 750，结果 UISegmentedControl 的横向
+    //   compression resistance 也是 750（UILayoutPriorityDefaultHigh），两者打平后
+    //   Auto Layout 选择撑大 stack —— 卡片宽出屏幕约 18pt，圆角全被切到屏幕外，
+    //   引擎 / 手感 / 高级三页（都有分段控件）整体溢出，系统页（没有分段）反而正常。
+    //   999 高于任何默认控件阻力，又留 1 点余量给下面的 720 上限。
+    NSLayoutConstraint *full = [self.stack.widthAnchor
+        constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-40];
+    full.priority = (UILayoutPriority)(UILayoutPriorityRequired - 1);
+    full.active = YES;
 
     [NSLayoutConstraint activateConstraints:@[
         [scroll.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
         [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [scroll.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
-        [self.stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16],
-        [self.stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-24],
-        [self.stack.leadingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.leadingAnchor constant:16],
-        [self.stack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor constant:-16],
-        [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32],
+        // 底部贴 view 而不是 safeArea：内容可以滚到悬浮玻璃标签栏底下，被毛玻璃透出来
+        [scroll.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [self.stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:8],
+        [self.stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-32],
+        [self.stack.centerXAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.centerXAnchor],
+        [self.stack.widthAnchor constraintLessThanOrEqualToConstant:720],
     ]];
 
-    UIBarButtonItem *save = [[UIBarButtonItem alloc] initWithTitle:@"保存"
-                                                             style:UIBarButtonItemStyleDone
-                                                            target:self
-                                                            action:@selector(saveTapped)];
-    self.saveItem = save;
-    self.navigationItem.rightBarButtonItem = save;
+    // 保存按钮：玻璃胶囊 + 品牌绿文字（原来是一条系统 Done 文字）
+    SIOGlassButton *saveBtn = [[SIOGlassButton alloc] initWithRadius:19.0];
+    saveBtn.translatesAutoresizingMaskIntoConstraints = NO;   // customView 自带尺寸约束，不能让掩码再插一脚
+    saveBtn.glassFill = SIOSurfaceStrong();
+    saveBtn.rimColor = SIOBorder();
+    [saveBtn sio_applyTheme];
+    [saveBtn setTitle:@"保存" forState:UIControlStateNormal];
+    [saveBtn setTitleColor:SIOAccent() forState:UIControlStateNormal];
+    [saveBtn setTitleColor:[SIOAccent() colorWithAlphaComponent:0.6] forState:UIControlStateHighlighted];
+    saveBtn.titleLabel.font = SIOFont(14, UIFontWeightSemibold);
+    saveBtn.titleLabel.adjustsFontForContentSizeCategory = YES;
+    [saveBtn addTarget:self action:@selector(saveTapped) forControlEvents:UIControlEventTouchUpInside];
+    [saveBtn.widthAnchor constraintGreaterThanOrEqualToConstant:76].active = YES;
+    [saveBtn.heightAnchor constraintEqualToConstant:36].active = YES;
+    self.saveButton = saveBtn;
+    self.saveItem = [[UIBarButtonItem alloc] initWithCustomView:saveBtn];
+    self.navigationItem.rightBarButtonItem = self.saveItem;
 
     [self buildContent];
+    // v2.5.1：内容建好后把所有子视图的横向抗压缩降到 749，让 999 的 stack 宽度约束永远赢。
+    // 只靠提高 stack 优先级还不够稳 —— 只要有一个控件（分段控件 / 长 label / 图片）的
+    // 阻力等于 1000，整列就会被它顶宽，而且是逐屏不同程度地顶宽，最难查。
+    SIOLoosenWidth(self.stack);
     // v2.1.20：控件全部建好之后再统一挂监听（脏标记 / 轻触反馈）
     [self sio_wireControls:self.view];
 
@@ -1868,14 +2341,28 @@ static BOOL gUIDirty = NO;
                                                object:nil];
 }
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // v2.5.1：悬浮胶囊标签栏浮在内容之上（scroll 一直延伸到屏幕底，好让内容从毛玻璃
+    // 底下透过去）。代价是最后一张卡会被永久压住滚不出来 —— 必须给 scroll 补底部 inset：
+    // 胶囊 74 + 距安全区 4 + 呼吸 12，再加一道安全区高度。
+    CGFloat bottom = 74.0 + 4.0 + 12.0 + self.view.safeAreaInsets.bottom;
+    if (fabs(self.scroll.contentInset.bottom - bottom) > 0.5) {
+        UIEdgeInsets in = UIEdgeInsetsMake(0, 0, bottom, 0);
+        self.scroll.contentInset = in;
+        self.scroll.verticalScrollIndicatorInsets = in;
+    }
+}
+
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self refreshSaveItem];   // 别的 Tab 改过配置，切回来也要显示「未保存」
 }
 
 - (void)refreshSaveItem {
-    if (!self.saveItem) return;
-    self.saveItem.title = gUIDirty ? @"保存 •" : @"保存";
+    NSString *t = gUIDirty ? @"保存 •" : @"保存";
+    if (self.saveItem) self.saveItem.title = t;
+    if (self.saveButton) [self.saveButton setTitle:t forState:UIControlStateNormal];
 }
 
 - (void)markDirty {
@@ -1892,6 +2379,13 @@ static BOOL gUIDirty = NO;
 
 // 递归给所有 UIControl 挂 valueChanged，给所有 UITextView 挂 delegate。
 // 好处：以后新增控件不需要再记得逐处写 target-action，脏标记自然覆盖到。
+// v2.5.0：把开关/滑杆的系统绿换成品牌祖母绿；「高危项」用的系统红保持原样
+static BOOL SIOColorIsRed(UIColor *c) {
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (!c || ![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
+    return (r > 0.75 && g < 0.45 && b < 0.45);
+}
+
 - (void)sio_wireControls:(UIView *)v {
     if ([v isKindOfClass:[UIControl class]]) {
         [(UIControl *)v addTarget:self
@@ -1904,6 +2398,18 @@ static BOOL gUIDirty = NO;
         }
     } else if ([v isKindOfClass:[UITextView class]]) {
         ((UITextView *)v).delegate = self;
+    }
+    // v2.5.0：开关 / 滑杆统一品牌色；分段控件在这里换玻璃皮肤
+    if ([v isKindOfClass:[UISwitch class]]) {
+        UISwitch *sw = (UISwitch *)v;
+        if (!SIOColorIsRed(sw.onTintColor)) sw.onTintColor = SIOAccent();
+    } else if ([v isKindOfClass:[UISlider class]]) {
+        UISlider *sl = (UISlider *)v;
+        sl.minimumTrackTintColor = SIOAccent();
+        sl.maximumTrackTintColor = SIOTrack();
+        sl.thumbTintColor = [UIColor whiteColor];
+    } else if ([v isKindOfClass:[UISegmentedControl class]]) {
+        SIOStyleSegmented((UISegmentedControl *)v);
     }
     for (UIView *s in v.subviews) [self sio_wireControls:s];
 }
@@ -1920,7 +2426,7 @@ static BOOL gUIDirty = NO;
 
 - (void)textViewDidChange:(UITextView *)textView { [self markDirty]; }
 
-#pragma mark - v2.1.20：浅/深色切换时重刷 CGColor
+#pragma mark - 浅/深色切换时重刷 CGColor
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previous {
     [super traitCollectionDidChange:previous];
@@ -1931,8 +2437,22 @@ static BOOL gUIDirty = NO;
     [self sio_refreshChrome:self.view];
 }
 
+// v2.5.0：玻璃卡片 / 玻璃按钮自带 trait 响应，这里只补两类「哑」控件：
+// 输入框的 1px 描边、分段控件的轨道与文字色。
+// 老实现无差别把所有 borderWidth>0 的描边改成 separatorColor，会把玻璃高光冲掉。
 - (void)sio_refreshChrome:(UIView *)v {
-    if (v.layer.borderWidth > 0) v.layer.borderColor = [UIColor separatorColor].CGColor;
+    if ([v isKindOfClass:[SIOGlassView class]] ||
+        [v isKindOfClass:[SIOGlassButton class]] ||
+        [v isKindOfClass:[SIOGradientHeader class]] ||
+        [v isKindOfClass:[SIOAmbientView class]]) {
+        // 自刷新，跳过
+    } else if ([v isKindOfClass:[UISegmentedControl class]]) {
+        SIOStyleSegmented((UISegmentedControl *)v);
+    } else if ([v isKindOfClass:[UITextView class]] && v.layer.borderWidth > 0) {
+        v.layer.borderColor = SIOBorderSoft().CGColor;
+    } else if ([v isKindOfClass:[UITextField class]] && v.layer.borderWidth > 0) {
+        v.layer.borderColor = SIOBorderSoft().CGColor;
+    }
     for (UIView *s in v.subviews) [self sio_refreshChrome:s];
 }
 
@@ -2061,7 +2581,7 @@ static BOOL gUIDirty = NO;
 
     // v2.4.0：场景预设 —— 保存当前参数为模板 / 一键切换 / 删除。
     // 与内置预设同一交互（套用前确认、套用即保存热重载），操作路径一步到位。
-    UIButton *up = SIOPill(@"📁 我的预设 · 场景一键切换", [UIColor systemPurpleColor], [UIColor whiteColor]);
+    UIButton *up = SIOPill(@"我的预设 · 场景一键切换", [UIColor systemPurpleColor], [UIColor whiteColor]);
     [up addTarget:self action:@selector(userPresetsTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.stack addArrangedSubview:up];
 
@@ -2071,12 +2591,12 @@ static BOOL gUIDirty = NO;
     [m.segMode addTarget:self action:@selector(changed) forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:SIOCard(@[
         SIORowSub(@"启用动画引擎", @"总开关，优先级最高：关闭后所有 hook 旁路，App 专属覆盖也无法再打开，系统拖拽系数一并恢复原生", m.swEnabled),
-        SIOLabel(@"模式", 16, [UIColor labelColor]),
+        SIOLabel(@"模式", 16, SIOTextPri()),
         m.segMode,
     ], 12)];
 
     // 倍率组
-    m.lblSpeed = SIOLabel(@"", 16, [UIColor labelColor]);
+    m.lblSpeed = SIOLabel(@"", 16, SIOTextPri());
     m.slSpeed = [[UISlider alloc] init];
     m.slSpeed.minimumValue = 1.0f;
     m.slSpeed.maximumValue = 50.0f;
@@ -2084,7 +2604,7 @@ static BOOL gUIDirty = NO;
     m.segSlow = [[UISegmentedControl alloc] initWithItems:@[ @"×2", @"×3", @"×5", @"×10" ]];
     [m.segSlow addTarget:self action:@selector(changed) forControlEvents:UIControlEventValueChanged];
     UIStackView *slowStack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        SIOLabel(@"慢放倍率", 16, [UIColor labelColor]), m.segSlow ]];
+        SIOLabel(@"慢放倍率", 16, SIOTextPri()), m.segSlow ]];
     slowStack.axis = UILayoutConstraintAxisVertical;
     slowStack.spacing = 8;
     m.slowWrap = slowStack;
@@ -2094,20 +2614,20 @@ static BOOL gUIDirty = NO;
     ], 10)];
 
     // v2.0.0 新引擎组
-    UILabel *ft = SIOLabel(@"动画时长下限", 16, [UIColor labelColor]);
+    UILabel *ft = SIOLabel(@"动画时长下限", 16, SIOTextPri());
     m.segFloor = [[UISegmentedControl alloc] initWithItems:@[ @"0.005", @"0.01", @"0.02", @"0.05" ]];
     [m.segFloor addTarget:self action:@selector(changed) forControlEvents:UIControlEventValueChanged];
-    m.lblFloor = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
+    m.lblFloor = SIOLabel(@"", 12, SIOTextSec());
 
-    UILabel *lt = SIOLabel(@"显式动画额外倍率", 16, [UIColor labelColor]);
+    UILabel *lt = SIOLabel(@"显式动画额外倍率", 16, SIOTextPri());
     m.segLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
     [m.segLayer addTarget:self action:@selector(changed) forControlEvents:UIControlEventValueChanged];
-    m.lblLayer = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
+    m.lblLayer = SIOLabel(@"", 12, SIOTextSec());
 
-    UILabel *tt = SIOLabel(@"转场独立额外倍率", 16, [UIColor labelColor]);
+    UILabel *tt = SIOLabel(@"转场独立额外倍率", 16, SIOTextPri());
     m.segTrans = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×1.5", @"×2", @"×3" ]];
     [m.segTrans addTarget:self action:@selector(changed) forControlEvents:UIControlEventValueChanged];
-    m.lblTrans = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
+    m.lblTrans = SIOLabel(@"", 12, SIOTextSec());
     [self.stack addArrangedSubview:SIOCard(@[
         ft, m.segFloor, m.lblFloor,
         lt, m.segLayer, m.lblLayer,
@@ -2129,7 +2649,7 @@ static BOOL gUIDirty = NO;
         "（v2.0.5 全量闪退的真凶是长按 hook，已整体移除）；若某 App 出现异常，"
         "到「手感」页逐项关闭实测。若动画完成回调异常（转圈闪没、工具栏不回位），"
         "把时长下限调回 0.01s 或更高。",
-        12, [UIColor secondaryLabelColor]);
+        12, SIOTextSec());
     [self.stack addArrangedSubview:hint];
     [self refreshHeader];
 }
@@ -2346,13 +2866,13 @@ static BOOL gUIDirty = NO;
         m.segHUDDelay,
         SIOLabel(@"加载圈要延后多久才显形。网络快的 App 调短（0.05s）几乎看不到转圈闪现；"
                  "网络慢的调长（0.30s–0.50s），否则用户会以为卡死。默认 0.15s。",
-                 12, [UIColor secondaryLabelColor]),
+                 12, SIOTextSec()),
     ], 10)];
 
     UILabel *instantNote = SIOLabel(
         @"注：IM 与支付类 App 在 dylib 内置保护名单内，这三项对它们自动不生效。"
         "若某个 App 出现打开白屏、内容没渲染完就切走，优先关掉「瞬时打开页面」和「网页提前显形」。",
-        12, [UIColor secondaryLabelColor]);
+        12, SIOTextSec());
     [self.stack addArrangedSubview:instantNote];
 
     // 列表加速（高危组）
@@ -2366,7 +2886,7 @@ static BOOL gUIDirty = NO;
     UILabel *feelNote = SIOLabel(
         @"注：滑行惯性 / 点击零延迟的 hook 是在目标 App 启动时按开关状态安装的 —— "
         "把这两项从关改开后，需要杀掉目标 App 重开才会生效；从开改关则热重载立即生效。",
-        12, [UIColor secondaryLabelColor]);
+        12, SIOTextSec());
     [self.stack addArrangedSubview:feelNote];
 
     UILabel *warn = SIOLabel(
@@ -2444,14 +2964,14 @@ static BOOL gUIDirty = NO;
     int idx = (int)m.segDrag.selectedSegmentIndex;
     double c = DragCoeffForIndex(idx);
     if (!m.swEnabled.on) {
-        m.lblDrag.textColor = [UIColor secondaryLabelColor];
+        m.lblDrag.textColor = SIOTextSec();
         m.lblDrag.text = @"总开关当前关闭：保存后此项会被清成原生值（v2.1.12 起），先开总开关再选档位。";
         return;
     }
     if (idx == 4) {
         m.lblDrag.text = @"「极端」写 0.0001：全系统动画≈归零，绕过 dylib 安全下限，可能触发回调配对错乱；不要与 dylib 加速同时拉满。";
     } else if (c <= 0.0) {
-        m.lblDrag.textColor = [UIColor secondaryLabelColor];
+        m.lblDrag.textColor = SIOTextSec();
         m.lblDrag.text = @"未启用。选 ×5 / ×10 / ×20 可全系统加速，不建议与 dylib 加速同时拉满（两机制叠加）。";
     } else {
         m.lblDrag.textColor = [UIColor systemOrangeColor];
@@ -2483,8 +3003,21 @@ static BOOL gUIDirty = NO;
     // v2.1.9：输入框支持多个 Bundle ID（逗号/空格/换行分隔），保存时批量生效
     [self.stack addArrangedSubview:SIOSectionTitle(@"App 专属覆盖（可一次填多个 Bundle ID）")];
     m.ovBundle = [[UITextField alloc] init];
-    m.ovBundle.placeholder = @"com.sfic.knight（多个用逗号/空格分隔）";
-    m.ovBundle.borderStyle = UITextBorderStyleRoundedRect;
+    // v2.5.0：系统圆角框换成玻璃输入面（避免卡片里嵌一块「系统白」）
+    m.ovBundle.attributedPlaceholder = [[NSAttributedString alloc]
+        initWithString:@"com.sfic.knight（多个用逗号/空格分隔）"
+            attributes:@{ NSForegroundColorAttributeName: SIOTextTer(),
+                          NSFontAttributeName: SIOFont(15, UIFontWeightRegular) }];
+    m.ovBundle.borderStyle = UITextBorderStyleNone;
+    m.ovBundle.backgroundColor = SIOSurfaceStrong();
+    m.ovBundle.textColor = SIOTextPri();
+    m.ovBundle.layer.cornerRadius = 14;
+    if (@available(iOS 13.0, *)) m.ovBundle.layer.cornerCurve = kCACornerCurveContinuous;
+    m.ovBundle.layer.borderWidth = 1;
+    m.ovBundle.layer.borderColor = SIOBorderSoft().CGColor;
+    UIView *ovPad = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 44)];
+    m.ovBundle.leftView = ovPad;
+    m.ovBundle.leftViewMode = UITextFieldViewModeAlways;
     m.ovBundle.font = SIOFont(15, UIFontWeightRegular);
     m.ovBundle.adjustsFontForContentSizeCategory = YES;
     m.ovBundle.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -2500,7 +3033,7 @@ static BOOL gUIDirty = NO;
 
     m.ovOn = [[UISwitch alloc] init];
     [m.ovOn addTarget:self action:@selector(ovToggled) forControlEvents:UIControlEventValueChanged];
-    m.ovSpeedLabel = SIOLabel(@"专属倍率（当前 ×5.0）", 16, [UIColor labelColor]);
+    m.ovSpeedLabel = SIOLabel(@"专属倍率（当前 ×5.0）", 16, SIOTextPri());
     m.ovSpeed = [[UISlider alloc] init];
     m.ovSpeed.minimumValue = 1.0f;
     m.ovSpeed.maximumValue = 50.0f;
@@ -2525,7 +3058,7 @@ static BOOL gUIDirty = NO;
     // v2.1.19：手感/HUD 保护按 App 单独设置
     m.ovFeelProtect = [[UISwitch alloc] init];
     m.ovHudProtect  = [[UISwitch alloc] init];
-    m.ovGuard = SIOLabel(@"", 12, [UIColor secondaryLabelColor]);
+    m.ovGuard = SIOLabel(@"", 12, SIOTextSec());
 
     // v2.3.3（功能加强）：新建覆盖时一键对齐当前全局配置，省去逐项手动调。
     UIButton *cloneBtn = SIOPill(@"从当前全局配置复制", [UIColor systemIndigoColor], [UIColor whiteColor]);
@@ -2538,10 +3071,10 @@ static BOOL gUIDirty = NO;
         SIORow(@"为该 App 启用专属配置", m.ovOn, nil),
         cloneBtn,
         m.ovSpeedLabel, m.ovSpeed,
-        SIOLabel(@"专属模式", 15, [UIColor labelColor]), m.ovMode,
-        SIOLabel(@"显式动画额外倍率", 15, [UIColor labelColor]), m.ovLayer,
-        SIOLabel(@"时长下限", 15, [UIColor labelColor]), m.ovFloor,
-        SIOLabel(@"转场额外倍率", 15, [UIColor labelColor]), m.ovTrans,
+        SIOLabel(@"专属模式", 15, SIOTextPri()), m.ovMode,
+        SIOLabel(@"显式动画额外倍率", 15, SIOTextPri()), m.ovLayer,
+        SIOLabel(@"时长下限", 15, SIOTextPri()), m.ovFloor,
+        SIOLabel(@"转场额外倍率", 15, SIOTextPri()), m.ovTrans,
         SIORow(@"弹簧参数缩放", m.ovSpring, nil),
         SIORow(@"进阶转场", m.ovExtra, nil),
         SIORow(@"列表加速（高危）", m.ovList, [UIColor systemRedColor]),
@@ -2550,11 +3083,11 @@ static BOOL gUIDirty = NO;
         SIORow(@"点击零延迟", m.ovFastTap, nil),
         // v2.1.10：瞬时打开三件套的专属覆盖版。某个 App 白屏/转场抽搐时，
         // 在这里单独关掉它的「瞬时打开页面」，不用动全局。
-        SIOLabel(@"瞬时打开（专属）", 15, [UIColor labelColor]),
+        SIOLabel(@"瞬时打开（专属）", 15, SIOTextPri()),
         SIORow(@"瞬时打开页面", m.ovInstant, nil),
         SIORow(@"加载圈 / HUD 加速", m.ovHUDFast, nil),
         SIORow(@"网页提前显形", m.ovWKFast, nil),
-        SIOLabel(@"转圈延迟（专属）", 15, [UIColor labelColor]),
+        SIOLabel(@"转圈延迟（专属）", 15, SIOTextPri()),
         m.ovHUDDelay,
         SIORow(@"手感保护（专属，强制跳过滑行/点按）", m.ovFeelProtect, nil),
         SIORow(@"HUD 保护（专属，强制不改转圈）", m.ovHudProtect, nil),
@@ -2580,11 +3113,11 @@ static BOOL gUIDirty = NO;
     // 每次保存时自动记录「保存前」的配置（无变化不记），上限 10 条；
     // 回滚前会把当前配置也压入历史 —— 回滚本身可再被回滚，等于自带撤销。
     [self.stack addArrangedSubview:SIOSectionTitle(@"配置历史（最近 10 次变更）")];
-    UIButton *histBtn = SIOPill(@"🕘 查看历史 / 一键回滚", [UIColor systemBrownColor], [UIColor whiteColor]);
+    UIButton *histBtn = SIOPill(@"查看历史 / 一键回滚", [UIColor systemBrownColor], [UIColor whiteColor]);
     [histBtn addTarget:self action:@selector(showHistory) forControlEvents:UIControlEventTouchUpInside];
     UILabel *histHint = SIOLabel(
         @"每次保存自动记录变更前的配置；回滚会先把当前配置存入历史，可再次回滚撤销。",
-        12, [UIColor secondaryLabelColor]);
+        12, SIOTextSec());
     [self.stack addArrangedSubview:SIOCard(@[ histBtn, histHint ], 10)];
 
     // ---- 自检 ----
@@ -2602,8 +3135,11 @@ static BOOL gUIDirty = NO;
     // v2.1.20：等宽字体也走 Dynamic Type（原来写死 Menlo 12，系统调大字号后报告不变）
     self.reportView.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleCaption1]
         scaledFontForFont:[UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular]];
-    self.reportView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    self.reportView.layer.cornerRadius = 12;
+    // v2.5.0：报告区改成「凹进去的玻璃槽」—— 比卡片更暗一档，和正文区分开
+    self.reportView.backgroundColor = SIOTrack();
+    self.reportView.textColor = SIOTextSec();
+    self.reportView.layer.cornerRadius = 14;
+    if (@available(iOS 13.0, *)) self.reportView.layer.cornerCurve = kCACornerCurveContinuous;
     self.reportView.textContainerInset = UIEdgeInsetsMake(12, 10, 12, 10);
     [self.reportView.heightAnchor constraintEqualToConstant:300].active = YES;
     [self.stack addArrangedSubview:SIOCard(@[ self.checkPill, self.reportView ], 10)];
@@ -2638,7 +3174,7 @@ static BOOL gUIDirty = NO;
          "（总开关关闭 / 黑名单 / 列表⛔硬保护 / 手感⛔跳过 / HUD⛔跳过 / 全部生效）；"
          "数字很小或全 0 先看这一行 —— 多半是被保护名单按设计拦住了，不是没注入。\n"
          "每次保存配置后计数清零，所以看到的都是当前参数下的分布。",
-        12, [UIColor secondaryLabelColor]);
+        12, SIOTextSec());
     hsNote.numberOfLines = 0;
     [self.stack addArrangedSubview:SIOCard(@[ hs, hsNote ], 10)];
 
@@ -2656,7 +3192,7 @@ static BOOL gUIDirty = NO;
         @"安全模式 —— 只保留纯时长缩放，关掉列表/缩放/手感/HUD/网页提前显形/瞬时转场，"
         @"倍率钳到 10×、下限抬到 0.02s，并在提示里标「🛡安全模式」。"
         @"活过一次后自动恢复正常配置。关掉这个开关等于完全禁用自愈（不推荐）。",
-        12, [UIColor secondaryLabelColor]);
+        12, SIOTextSec());
     [self.stack addArrangedSubview:SIOCard(@[
         SIORowSub(@"安全启动（自动熔断）", @"连续崩 3 次自动降级，避免「配错就开不了 App」", m.swSafeBoot),
         safeBtn,
@@ -2685,7 +3221,7 @@ static BOOL gUIDirty = NO;
 
     UILabel *hint = SIOLabel(
         [NSString stringWithFormat:@"%@：支持可调时长下限、转场独立倍率、App 专属覆盖多 ID 批量生效、setter 强黏手感与热重载生效提示。dylib 与配置器版本必须配套。", SIO_VERSION],
-        12, [UIColor secondaryLabelColor]);
+        12, SIOTextSec());
     [self.stack addArrangedSubview:hint];
 }
 
@@ -2756,10 +3292,10 @@ static BOOL gUIDirty = NO;
         m.ovGuard.textColor = [UIColor systemOrangeColor];
     } else if (m.ovOn.on) {
         m.ovGuard.text = [NSString stringWithFormat:@"保存后将为 %@ 创建专属配置。", scope];
-        m.ovGuard.textColor = [UIColor secondaryLabelColor];
+        m.ovGuard.textColor = SIOTextSec();
     } else {
         m.ovGuard.text = [NSString stringWithFormat:@"保存后将删除 %@ 的专属配置，回到全局配置。", scope];
-        m.ovGuard.textColor = [UIColor secondaryLabelColor];
+        m.ovGuard.textColor = SIOTextSec();
     }
 }
 
@@ -3014,6 +3550,253 @@ static BOOL gUIDirty = NO;
 
 @end
 
+#pragma mark - v2.5.0 悬浮玻璃标签栏
+
+// 系统 UITabBar 没法做「悬浮胶囊 + 毛玻璃透出内容」，所以改成自绘：
+// 一个 SIOGlassView 当胶囊，里面四个 SIOTabItem（UIControl 子类，带选中态与按压反馈）。
+@interface SIOTabItem : UIControl
+@property (nonatomic, strong) UIView *pill;
+@property (nonatomic, strong) UIImageView *iconView;
+@property (nonatomic, strong) UILabel *capLabel;
+- (instancetype)initWithTitle:(NSString *)t symbol:(NSString *)sym;
+@end
+
+@implementation SIOTabItem
+
+- (instancetype)initWithTitle:(NSString *)t symbol:(NSString *)sym {
+    if ((self = [super initWithFrame:CGRectZero])) {
+        self.translatesAutoresizingMaskIntoConstraints = NO;
+
+        _pill = [[UIView alloc] init];
+        _pill.translatesAutoresizingMaskIntoConstraints = NO;
+        _pill.backgroundColor = SIOAccentSoft();
+        _pill.layer.cornerRadius = 30;
+        _pill.layer.cornerCurve = kCACornerCurveContinuous;
+        _pill.alpha = 0.0;
+        _pill.userInteractionEnabled = NO;
+        [self addSubview:_pill];
+
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+            configurationWithPointSize:18 weight:UIImageSymbolWeightMedium];
+        _iconView = [[UIImageView alloc] initWithImage:
+                     [[UIImage systemImageNamed:sym] imageWithConfiguration:cfg]];
+        _iconView.contentMode = UIViewContentModeScaleAspectFit;
+        _iconView.tintColor = SIOTextSec();
+        _iconView.translatesAutoresizingMaskIntoConstraints = NO;
+        _iconView.userInteractionEnabled = NO;
+        [self addSubview:_iconView];
+
+        _capLabel = [[UILabel alloc] init];
+        _capLabel.text = t;
+        _capLabel.font = SIOFont(10, UIFontWeightMedium);
+        _capLabel.textColor = SIOTextSec();
+        _capLabel.textAlignment = NSTextAlignmentCenter;
+        _capLabel.adjustsFontForContentSizeCategory = YES;
+        _capLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        _capLabel.userInteractionEnabled = NO;
+        [self addSubview:_capLabel];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [_pill.topAnchor constraintEqualToAnchor:self.topAnchor],
+            [_pill.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+            [_pill.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+            [_pill.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+
+            [_iconView.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            [_iconView.topAnchor constraintEqualToAnchor:self.topAnchor constant:11],
+            [_iconView.widthAnchor constraintEqualToConstant:19],
+            [_iconView.heightAnchor constraintEqualToConstant:19],
+
+            [_capLabel.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            [_capLabel.topAnchor constraintEqualToAnchor:_iconView.bottomAnchor constant:4],
+            [_capLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor constant:2],
+            [_capLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-2],
+        ]];
+    }
+    return self;
+}
+
+- (void)sio_applyTheme {
+    BOOL on = self.selected;
+    self.iconView.tintColor = on ? SIOAccent() : SIOTextSec();
+    self.capLabel.textColor = on ? SIOAccent() : SIOTextSec();
+    self.pill.backgroundColor = SIOAccentSoft();
+}
+
+- (void)setSelected:(BOOL)selected {
+    [super setSelected:selected];
+    self.capLabel.font = SIOFont(10, selected ? UIFontWeightSemibold : UIFontWeightMedium);
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{
+        self.pill.alpha = selected ? 1.0 : 0.0;
+        self.iconView.tintColor = selected ? SIOAccent() : SIOTextSec();
+        self.capLabel.textColor = selected ? SIOAccent() : SIOTextSec();
+    } completion:nil];
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    [UIView animateWithDuration:(highlighted ? 0.12 : 0.18)
+                          delay:0
+                        options:(UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        self.transform = highlighted ? CGAffineTransformMakeScale(0.95, 0.95)
+                                     : CGAffineTransformIdentity;
+        self.alpha = highlighted ? 0.9 : 1.0;
+    } completion:nil];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    [super traitCollectionDidChange:previous];
+    if (@available(iOS 13.0, *)) {
+        if (!previous || previous.userInterfaceStyle == self.traitCollection.userInterfaceStyle) return;
+    }
+    [self sio_applyTheme];
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [self sio_applyTheme];
+}
+@end
+
+// 根容器：四个导航栈 + 悬浮玻璃标签栏。
+// 不用 UITabBarController 的原因：系统标签栏在 iOS 26 上仍是不透明材质条，
+// 且会占掉安全区，做不到「内容从毛玻璃下面透过去」。
+@interface SIORootVC : UIViewController
+@property (nonatomic, strong) NSArray<UINavigationController *> *navs;
+@property (nonatomic, strong) NSArray<SIOTabItem *> *items;
+@property (nonatomic, strong) SIOGlassView *bar;
+@property (nonatomic, assign) NSInteger selectedIndex;
+- (instancetype)initWithNavs:(NSArray<UINavigationController *> *)navs;
+@end
+
+@implementation SIORootVC
+
+- (instancetype)initWithNavs:(NSArray<UINavigationController *> *)navs {
+    if ((self = [super initWithNibName:nil bundle:nil])) {
+        _navs = navs;
+        // 每个导航栈底部让 82pt 给悬浮标签栏，页面内容不会钻到胶囊底下
+        for (UINavigationController *n in navs) {
+            n.additionalSafeAreaInsets = UIEdgeInsetsMake(0, 0, 82, 0);
+        }
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = SIOBG();
+
+    SIOGlassView *bar = [[SIOGlassView alloc] initWithRadius:37.0];
+    bar.elevated = YES;
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:bar];
+    self.bar = bar;
+
+    UIStackView *row = [[UIStackView alloc] init];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = 4;
+    row.distribution = UIStackViewDistributionFillEqually;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    [bar.contentView addSubview:row];
+
+    NSArray *titles = @[ @"引擎", @"手感", @"系统", @"高级" ];
+    NSArray *syms   = @[ @"bolt.fill", @"hand.tap", @"gearshape.fill", @"slider.horizontal.3" ];
+    NSMutableArray *arr = [NSMutableArray array];
+    for (NSInteger i = 0; i < titles.count; i++) {
+        SIOTabItem *it = [[SIOTabItem alloc] initWithTitle:titles[(NSUInteger)i]
+                                                    symbol:syms[(NSUInteger)i]];
+        it.tag = i;
+        [it addTarget:self action:@selector(tabTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [row addArrangedSubview:it];
+        [arr addObject:it];
+    }
+    self.items = arr;
+
+    // 手机上「左右各 16」，宽屏（iPad）上封顶 420 并居中 —— 否则一条胶囊会横贯 1024pt
+    NSLayoutConstraint *barWide = [bar.widthAnchor constraintEqualToAnchor:self.view.widthAnchor constant:-32];
+    barWide.priority = 750;
+    barWide.active = YES;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [bar.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [bar.widthAnchor constraintLessThanOrEqualToConstant:420],
+        [bar.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-4],
+        [bar.heightAnchor constraintEqualToConstant:74],
+        [row.topAnchor constraintEqualToAnchor:bar.contentView.topAnchor constant:7],
+        [row.bottomAnchor constraintEqualToAnchor:bar.contentView.bottomAnchor constant:-7],
+        [row.leadingAnchor constraintEqualToAnchor:bar.contentView.leadingAnchor constant:7],
+        [row.trailingAnchor constraintEqualToAnchor:bar.contentView.trailingAnchor constant:-7],
+    ]];
+
+    if (self.navs.count) {
+        UINavigationController *first = self.navs.firstObject;
+        [self addChildViewController:first];
+        first.view.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.view insertSubview:first.view belowSubview:bar];
+        [NSLayoutConstraint activateConstraints:@[
+            [first.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+            [first.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+            [first.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+            [first.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        ]];
+        [first didMoveToParentViewController:self];
+        self.selectedIndex = 0;
+        [self sio_updateSelection];
+    }
+}
+
+- (void)tabTapped:(SIOTabItem *)sender {
+    [self sio_selectIndex:sender.tag];
+}
+
+- (void)sio_updateSelection {
+    for (SIOTabItem *it in self.items) it.selected = (it.tag == self.selectedIndex);
+}
+
+- (void)sio_selectIndex:(NSInteger)idx {
+    if (idx < 0 || idx >= (NSInteger)self.navs.count) return;
+    UINavigationController *to = self.navs[(NSUInteger)idx];
+    UIViewController *from = self.childViewControllers.firstObject;
+    self.selectedIndex = idx;
+    [self sio_updateSelection];
+    if (!from || from == to) return;
+
+    [self addChildViewController:to];
+    to.view.translatesAutoresizingMaskIntoConstraints = NO;
+    to.view.alpha = 0.0;
+    to.view.transform = CGAffineTransformMakeScale(0.985, 0.985);
+    [self.view insertSubview:to.view belowSubview:self.bar];
+    [NSLayoutConstraint activateConstraints:@[
+        [to.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [to.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [to.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [to.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+    ]];
+    [from willMoveToParentViewController:nil];
+
+    // 交叉淡入 + 轻微放大：比系统的水平推挤更轻，和「玻璃」语言一致
+    [UIView animateWithDuration:0.22
+                          delay:0
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
+        to.view.alpha = 1.0;
+        to.view.transform = CGAffineTransformIdentity;
+        from.view.alpha = 0.0;
+        from.view.transform = CGAffineTransformMakeScale(0.985, 0.985);
+    } completion:^(BOOL finished) {
+        [from.view removeFromSuperview];
+        [from removeFromParentViewController];
+        [to didMoveToParentViewController:self];
+        from.view.alpha = 1.0;
+        from.view.transform = CGAffineTransformIdentity;
+    }];
+}
+@end
+
 #pragma mark - App Delegate
 
 @interface SIOAppDelegate : UIResponder <UIApplicationDelegate>
@@ -3041,45 +3824,43 @@ static BOOL gUIDirty = NO;
     [model loadControlValues];
     [e refreshHeader];   // v2.1.0：载入配置后立刻刷新头部的实时状态行
 
-    UINavigationController *(^nav)(UIViewController *, NSString *, NSString *) =
-        ^(UIViewController *vc, NSString *icon, NSString *title) {
+    UINavigationController *(^nav)(UIViewController *) =
+        ^(UIViewController *vc) {
         UINavigationController *n = [[UINavigationController alloc] initWithRootViewController:vc];
-        n.tabBarItem = [[UITabBarItem alloc] initWithTitle:title
-                                                     image:[UIImage systemImageNamed:icon]
-                                                       tag:0];
-        // v2.1.20（HIG）：导航栏回到系统默认外观 + 大标题。
-        // 旧版是不透明深绿底 + 白字，等于把系统导航栏重绘成品牌条：
-        //   · 浅/深色切换时不会跟随系统材质，深色下显得脏；
-        //   · 大标题（Apple 从 iOS 11 起的主导航语言）被关掉，页面层级全靠卡片堆叠；
-        //   · 白色 tintColor 让返回箭头/按钮失去系统强调色语义。
-        // 现在：系统默认背景（毛玻璃）+ 系统强调色 tint + 大标题。
         n.navigationBar.prefersLargeTitles = YES;
         vc.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
+        // v2.5.0：透明导航栏 —— 大标题直接浮在环境光斑上，滚动时也不会横插一条白条。
+        // 老版本用系统材质条，和玻璃卡片是两套材质语言，接缝很明显。
         if (@available(iOS 13.0, *)) {
             UINavigationBarAppearance *ap = [[UINavigationBarAppearance alloc] init];
-            [ap configureWithDefaultBackground];   // 系统材质，浅/深色自动适配
-            n.navigationBar.standardAppearance = ap;
-            n.navigationBar.scrollEdgeAppearance = ap;
-            n.navigationBar.compactAppearance = ap;
+            [ap configureWithTransparentBackground];
+            ap.backgroundColor = [UIColor clearColor];
+            ap.shadowColor = [UIColor clearColor];
+            ap.titleTextAttributes = @{ NSForegroundColorAttributeName: SIOTextPri(),
+                                        NSFontAttributeName: SIOFont(17, UIFontWeightSemibold) };
+            ap.largeTitleTextAttributes = @{ NSForegroundColorAttributeName: SIOTextPri(),
+                                             NSFontAttributeName: SIOFont(32, UIFontWeightBold) };
+            // 滚动后：超薄磨砂条（不是白条，也不是实心绿），标题仍然压在玻璃上
+            UINavigationBarAppearance *apScrolled = [[UINavigationBarAppearance alloc] init];
+            [apScrolled configureWithDefaultBackground];
+            apScrolled.backgroundColor = [UIColor clearColor];
+            apScrolled.backgroundEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
+            apScrolled.shadowColor = [UIColor clearColor];
+            apScrolled.titleTextAttributes = ap.titleTextAttributes;
+            apScrolled.largeTitleTextAttributes = ap.largeTitleTextAttributes;
+            n.navigationBar.standardAppearance = apScrolled;
+            n.navigationBar.compactAppearance = apScrolled;
+            n.navigationBar.scrollEdgeAppearance = ap;   // 顶部：完全透明
+            if (@available(iOS 15.0, *)) n.navigationBar.compactScrollEdgeAppearance = ap;
         }
         n.navigationBar.tintColor = SIOAccent();
         return n;
     };
-    UITabBarController *tab = [[UITabBarController alloc] init];
-    tab.viewControllers = @[ nav(e, @"bolt.fill", @"引擎"),
-                             nav(f, @"hand.tap", @"手感"),
-                             nav(s, @"gear", @"系统"),
-                             nav(a, @"wrench.fill", @"高级") ];
-    tab.tabBar.tintColor = SIOAccent();
-    if (@available(iOS 13.0, *)) {
-        UITabBarAppearance *ta = [[UITabBarAppearance alloc] init];
-        [ta configureWithDefaultBackground];   // v2.1.20：系统材质（原为不透明纯色）
-        tab.tabBar.standardAppearance = ta;
-        if (@available(iOS 15.0, *)) tab.tabBar.scrollEdgeAppearance = ta;
-    }
+
+    SIORootVC *root = [[SIORootVC alloc] initWithNavs:@[ nav(e), nav(f), nav(s), nav(a) ]];
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.window.rootViewController = tab;
+    self.window.rootViewController = root;
     [self.window makeKeyAndVisible];
 
     // v2.1.1：若确实清洗过旧配置，明确告知用户发生了什么（不静默改设置）
@@ -3093,7 +3874,7 @@ static BOOL gUIDirty = NO;
                         @"其余加速项已全部默认开启。"
                 preferredStyle:UIAlertControllerStyleAlert];
             [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-            [tab presentViewController:a animated:YES completion:nil];
+            [root presentViewController:a animated:YES completion:nil];
         });
     }
     return YES;

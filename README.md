@@ -86,6 +86,79 @@ tools/config_contract.py  # 构建前配置契约门禁
 .github/workflows/build.yml
 ```
 
+## 界面改版：iOS 26 玻璃质感（仅配置 App）
+
+> 只动 `App/main.m` 的呈现层，**没有改任何配置键、默认值、写入路径或 dylib**。
+> `config_contract.py` 门禁仍然通过（键集合双向一致 + 四处默认值一致）。
+
+设计语言四层，改的都是公共构件，四个页面自动跟着变：
+
+| 层 | 实现 |
+| --- | --- |
+| 底 | `SIOAmbientView`：三团 `kCAGradientLayerRadial` 光斑（祖母绿 / 天蓝 / 青柠），浅深各一套 |
+| 玻璃 | `SIOGlassView`：`UIVisualEffectView` + 半透明白 tint（浅 66% / 深 10%） |
+| 高光 | 顶部 55% 的白色 sheen + 1px 描边（`SIOBorder()`，浅色发白、深色发灰） |
+| 阴影 | 外层双层投影（近 2 / 远 18），卡片 `elevated = YES` 才开 |
+
+改动的公共构件：
+
+- `SIOCard` → 26pt 连续圆角的玻璃卡（原来是不透明 `secondarySystemGroupedBackgroundColor`）
+- `SIOPill` / `SIOPresetButton` → `SIOGlassButton`，调用方传的实心色自动换算成 **16% tinted glass**；
+  「白底 + 彩字」的那批按钮识别为描边款，发丝描边跟着文字色走
+- `SIOFieldTextView` / 高级页 Bundle ID 输入框 → 玻璃输入面
+- `SIOGradientHeader` → 渐变玻璃卡 + 发光状态点 + 玻璃版本徽章（渐变三档不变）
+- 标签栏 → 自绘悬浮胶囊（`SIORootVC` + `SIOTabItem`），不再用 `UITabBarController`：
+  系统标签栏做不出「内容从毛玻璃底下透过去」，也占安全区
+- 导航栏 → 顶部完全透明（大标题浮在光斑上），滚动后切超薄磨砂条
+
+深浅色：颜色全部走 `colorWithDynamicProvider`，**没有第二套常量**。
+`borderColor` / `shadowColor` / 渐变这些 `CGColor` 快照由各玻璃视图在 `traitCollectionDidChange`
+和 `didMoveToWindow` 里自己重刷 —— 老代码那段「递归把所有描边刷成 `separatorColor`」的补丁已删除，
+它会把玻璃高光冲掉。
+
+动态反馈：`SIOGlassButton` / `SIOTabItem` 按下缩到 0.975、透明度 0.92（120ms 进 / 180ms 回），
+开关与分段仍保留 `.light` 轻触反馈，滑杆拖动不震动。
+
+### v2.5.1 修正（真机第一轮回馈）
+
+真机上「引擎 / 手感 / 高级」三页整体横向溢出、左右各被切掉一段，系统页正常。三个问题：
+
+1. **内容列被撑宽**。`viewDidLoad` 里 `stack.width == scroll.frameLayoutGuide.width - 40`
+   的优先级写成了 750，而 `UISegmentedControl` 的横向 compression resistance 默认也是 750。
+   两者打平时 Auto Layout 选择撑大 stack，卡片跟着宽出屏幕约 18pt，圆角全被切到视野外。
+   → 宽度约束提到 999；同时 `SIOLoosenWidth()` 把内容树的横向阻力统一降到 749
+   （遇到 `UIControl` 就不再往下钻，系统控件内部不动）；分段控件额外 `apportionsSegmentWidthsByContent = NO`。
+2. **最后一张卡被悬浮标签栏永久压住**。scroll 一直延伸到屏幕底（好让内容从毛玻璃底下透过去），
+   但没补 `contentInset`。→ `viewDidLayoutSubviews` 里补 74 + 4 + 12 + 安全区。
+3. **深色下玻璃没有可折射的底**。光斑透明度只有 0.20 / 0.15 / 0.10，在近黑底上几乎不可见，
+   整屏看起来就是「黑底 + 灰板」。→ 提到 0.34 / 0.26 / 0.19。
+
+### 非 macOS 环境打包（重要）
+
+CI 里是 `codesign --force --sign - --entitlements entitlements.plist "$APP"`。
+如果只编译不签名，二进制里没有 code signature 段，`ldid -e` 读不到 entitlements，
+安装后 App 会退回默认沙箱 —— 表现就是「保存失败：无法写入 com.apple.UIKit.plist」。
+
+Windows 上没有 codesign / ldid，用 `tools/adhoc_sign.py` 补：
+
+```bash
+python tools/adhoc_sign.py Payload/SIOriginal.app/SIOriginal SIOriginal entitlements.plist
+```
+
+它构造 `SuperBlob{ CodeDirectory(SHA-256), blobWrapper(Entitlements) }`、插入 `LC_CODE_SIGNATURE`、
+把 `__LINKEDIT` 的 filesize 撑到签名末尾。
+
+兼容与性能：
+
+- iOS 26 优先用 `UIGlassEffect`（`NSClassFromString` + `objc_msgSend` 运行时探测，
+  旧 SDK 里没有这个符号也能编译；`-miphoneos-version-min=14.0` 不变）
+- iOS 14–25 回落 `UIBlurEffectStyleSystemMaterial`
+- 只有卡片 / 标签栏 / 头部叠真模糊；胶囊和预设块只用半透明色，不叠 `UIVisualEffectView`
+- 响应式：内容最大宽度 720 居中，标签栏封顶 420 居中（iPad 上不会拉成一条长横幅）
+
+调参入口集中在 `main.m` 设计系统段顶部：`SIOSurface()` / `SIOBorder()` / `SIOAccent()` 等函数，
+改一处全 App 生效。
+
 ## 构建
 
 推 `jisuios-v*` 或 `sioriginal-v*` tag，或手动 `workflow_dispatch` 触发 `build.yml`（macos-14 / Xcode）。
