@@ -1,4 +1,4 @@
-// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.2
+// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.3
 //
 // ===================== v2.3.1 保活打磨（三处，省电 / 可观测）=====================
 // 不碰保活机制本身，只改三件事：
@@ -2826,7 +2826,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.4.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.4.3 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3312,39 +3312,43 @@ static BOOL _fbg_isExcluded(void) {
     return NO;
 }
 
-// v2.4.2（崩溃修复）：场景伪装的**硬排除**名单。
-// 与 _fbg_isExcluded 的区别：
-//   - _fbg_isExcluded 排的是「整个 FUBG」（场景 + 音频一起关）；
-//   - 这里只关「场景伪装 + applicationState 伪装」，音频断言保活照常。
+// ---- v2.4.3：后台工作线程识别（替代 v2.4.2 的整段场景排除）----
 //
-// 判定依据（2026-10-23 的 .ips：WeChat 8.0.58 / iOS 16.2 / iPhone 14 Pro）：
-//   EXC_BAD_ACCESS (KERN_INVALID_ADDRESS at 0x18)，faultingThread 在
-//   com.tencent.xin.fts.mainIndex 串行队列，主线程停在 mach_msg（进程真实在后台），
-//   栈上全是 WeChat 自身代码、无任何注入库帧 —— 典型「按前台路径访问已失效对象」。
-//   微信的 FTS 全文索引线程正是靠 applicationState 决定走前台还是后台路径：
-//   场景伪装把 backgrounding diff 吞掉、applicationState 又谎报 Active，
-//   索引线程于是按前台路径去拿只在前台有效的上下文，拿到 nil 后读 +0x18 直接崩。
-//   同一个落点也是 README 记录的「微信聊天视频切走出现两个画面」的诱因。
+// v2.4.2 试过的方案是把微信整个排除出场景伪装。实测不行，原因不在崩溃，在**体验**：
+// 吞掉 backgrounding diff 时，微信收不到 didEnterBackground，因而不知道自己进了后台，
+// 长连接保持 → 切回秒开。一旦不吞了，微信会按自己的省电逻辑主动把长连接降级成推送
+// 通道，每次切回都要重连（用户看到的「联网加载中」）。这就是「真后台保活」的全部意义，
+// 不能拿它去换稳定性。
 //
-// 结论：状态伪装对「重度依赖 appState 分流业务」的 App 收益接近 0、风险最高，
-// 这类 App 干脆不让它上。音频断言不伪造任何系统状态，不受影响。
-static BOOL _fbg_sceneHardExcluded(void) {
-    static NSArray *list = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        list = @[
-            @"com.tencent.xin",       // 微信：FTS 索引线程按 appState 分流，伪装后读 nil+0x18 崩溃
-        ];
-    });
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    return bid.length && [list containsObject:bid];
+// 所以回到「吞 diff」，但把崩溃点精确定位后掐掉：
+//   崩溃线程是 com.tencent.xin.fts.mainIndex（微信全文索引串行队列），
+//   主线程停在 mach_msg。假前台状态下 applicationState 原生就返回 Active
+//   （scene 没推进，不需要 hook 也是 Active），索引线程于是按前台路径去取
+//   已被系统回收的上下文 —— 读到 nil+0x18。注入库在这条栈上没有任何帧。
+//
+// 修法：只对**后台工作队列**（FTS 索引 / 主索引这类）如实回答 Background，
+// 让它们走微信自己的后台索引分支；主线程、网络线程仍然拿 Active，
+// 保活的「秒回」效果完全不受影响。判断按线程用 __thread 缓存，零重复开销。
+static BOOL _fbg_isBackgroundWorkerThread(void) {
+    static __thread int cached = -1;   // -1 未判定 / 0 否 / 1 是
+    if (cached >= 0) return cached == 1;
+    BOOL hit = NO;
+    const char *label = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+    if (label) {
+        // 微信：com.tencent.xin.fts.mainIndex / *.fts.* ；其他 App 的索引线程命名同理
+        if (strstr(label, ".fts.") || strstr(label, "mainIndex") ||
+            strstr(label, ".index.") || strstr(label, "IndexQueue")) {
+            hit = YES;
+        }
+    }
+    cached = hit ? 1 : 0;
+    return hit;
 }
 
 static void _fbg_recalc(void) {
     BOOL wasScene = gUseScene;
     gActive   = gFUBGEnabled && !_fbg_isExcluded();
-    // v2.4.2：场景伪装额外受硬排除名单约束；音频保活不看这张表（它不碰系统状态）。
-    gUseScene = gActive && gSceneFake && !_fbg_sceneHardExcluded();
+    gUseScene = gActive && gSceneFake;
     gUseAudio = gActive && gAudioKeep;
     // v2.3.3（审查 P2）：场景伪装关闭时清零上次吞 diff 时间戳，
     // 避免状态行把"很久以前工作过"误判为"近期仍在工作"。
@@ -3455,6 +3459,10 @@ static void *_fbg_asLastRet = NULL;
 static BOOL  _fbg_asLastBg  = NO;
 
 static UIApplicationState _fbg_appState(id self, SEL _cmd) {
+    // v2.4.3（崩溃规避）：假前台期间，后台工作线程必须是**唯一**能拿到真实答案的调用方。
+    // 它们干的是索引/落盘这类不需要 UI 的活，走后台分支才是正确输入；而它们恰恰是
+    // 按前台路径访问已回收上下文会崩的那批线程（微信 fts.mainIndex 读 nil+0x18）。
+    if (gUseScene && _fbg_isBackgroundWorkerThread()) return UIApplicationStateBackground;
     if (gUseScene && gPhysBg) {
         // 推送/通知框架需要真实答案：前台态时它们不会建立后台接收通道
         void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
@@ -3874,7 +3882,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.4.2 (SIOriginal v2.4.2) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.4.3 (SIOriginal v2.4.3) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
