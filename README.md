@@ -1,4 +1,4 @@
-# 极速IOS（原 SIOriginal）v2.4.2
+# 极速IOS（原 SIOriginal）v2.4.3
 
 iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
@@ -6,7 +6,30 @@ iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollS
 - dylib 文件名与 install_name 保持 `SIOriginal.dylib`（TrollFools 注入兼容，勿手动改名）
 - bundle id `com.local.sioriginal`、配置路径 `/var/Managed Preferences/mobile/com.apple.UIKit.plist`、热重载通知名均保持不变 —— 覆盖安装不会丢配置
 
-## v2.4.2 变更
+## v2.4.3 变更：保活与崩溃的平衡点
+
+v2.4.2 把微信整段排除出场景伪装，**实测不可接受**：微信收不到 `didEnterBackground` 就不会
+主动断长连接（这是它能「切回秒开」的唯一原因）；一旦恢复真实生命周期，微信按自己的省电
+逻辑把长连接降级成推送通道，每次切回都要重连。
+
+本版改回「吞 diff」，但把崩溃点定点掐掉：
+
+```c
+// 假前台期间，只有后台工作队列能拿到真实答案
+if (gUseScene && _fbg_isBackgroundWorkerThread()) return UIApplicationStateBackground;
+```
+
+判定依据是当前队列 label（`dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL)`），
+命中 `.fts.` / `mainIndex` / `.index.` / `IndexQueue` 即为后台工作线程，结果按线程用
+`__thread` 缓存，热路径没有额外 dladdr、没有分配。
+
+效果：主线程与网络线程仍拿 `Active`（保活/秒回不变），微信 FTS 索引线程拿 `Background`，
+走它自己的后台索引分支，不再按前台路径去取已被回收的上下文。
+
+**边界**：这是对已知崩溃线程的定点规避，不是「假前台绝对安全」的证明。再出现同类崩溃时，
+把新线程的队列 label 关键词加进 `_fbg_isBackgroundWorkerThread` 即可，不必改动其他逻辑。
+
+## v2.4.2 变更（历史）
 
 ### 1. 改名
 
