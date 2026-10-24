@@ -1,6 +1,13 @@
-// SIOriginal（显示名：极速IOS）— 保活专版 v1.1.0（基于 v2.4.3 精简）
+// SIOriginal（显示名：极速IOS）— 保活专版 v1.2.0（基于 v2.4.3 精简）
 //
-// ===================== v1.1.0 修复「切回微信重新加载」=====================
+// ===================== v1.2.0 打开即刷新 =====================
+// 用户需求只有两个：①后台保活（消息照收）；②每次点开微信都刷新重新加载。
+// 实现：后台期间场景伪装+音频断言全量保活；一旦回到前台（图标点开），
+// 立即 exit(0) 退出进程——本次点开看到的就是全新冷启动界面。
+// 冷启动本身不触发前后台切换通知，不会被误杀。
+// 开关：plist 键 FUBGReloadOnOpen（缺省 YES），支持 AppOverrides 按 App 关闭。
+//
+// ===================== v1.1.0 修复「后台收不到消息」=====================
 // 根因：场景伪装吞掉 backgrounding diff 后，UIKit 可能不再发
 // UIApplicationDidEnterBackgroundNotification → gPhysBg 恒为 NO →
 // 音频断言/看门狗从未启动 → 微信后台被挂起杀掉 → 切回冷启动重新加载。
@@ -95,6 +102,7 @@ static BOOL FUBG_builtinExcluded(void) {
 static BOOL    gFUBGEnabled = YES;   // 启用真后台保活（总开关）——缺省开
 static BOOL    gSceneFake   = YES;   // 场景伪装引擎——缺省开
 static BOOL    gAudioKeep   = YES;   // 音频断言兜底——缺省开
+static BOOL    gReloadOnOpen = YES;  // v1.2.0：每次点开都刷新重新加载——缺省开
 static NSArray *gExclude    = nil;
 
 static BOOL    gActive   = NO;   // 本 App 最终是否参与保活（总开关 ∧ 排除名单）
@@ -159,6 +167,7 @@ static void FUBG_resetDefaults(void) {
     gFUBGEnabled = YES;
     gSceneFake   = YES;
     gAudioKeep   = YES;
+    gReloadOnOpen = YES;
     gExclude     = @[];
 }
 
@@ -173,6 +182,7 @@ static void FUBG_loadPref(void) {
             if (d[@"FUBGEnabled"])   gFUBGEnabled = [d[@"FUBGEnabled"] boolValue];
             if (d[@"FUBGSceneFake"]) gSceneFake   = [d[@"FUBGSceneFake"] boolValue];
             if (d[@"FUBGAudioKeep"]) gAudioKeep   = [d[@"FUBGAudioKeep"] boolValue];
+            if (d[@"FUBGReloadOnOpen"]) gReloadOnOpen = [d[@"FUBGReloadOnOpen"] boolValue];
             // 黑名单：兼容 NSArray 与逗号分隔字符串
             NSMutableArray *ex = [NSMutableArray array];
             id bl = d[@"Blacklist"];
@@ -197,6 +207,7 @@ static void FUBG_loadPref(void) {
                 if (ovr[@"FUBGEnabled"])   gFUBGEnabled = [ovr[@"FUBGEnabled"] boolValue];
                 if (ovr[@"FUBGSceneFake"]) gSceneFake   = [ovr[@"FUBGSceneFake"] boolValue];
                 if (ovr[@"FUBGAudioKeep"]) gAudioKeep   = [ovr[@"FUBGAudioKeep"] boolValue];
+                if (ovr[@"FUBGReloadOnOpen"]) gReloadOnOpen = [ovr[@"FUBGReloadOnOpen"] boolValue];
             }
         }
     } @catch (__unused NSException *e) {}
@@ -567,6 +578,13 @@ static void FUBG_onEnterForeground(__unused NSNotification *note) {
         [[UIApplication sharedApplication] endBackgroundTask:gTask];
         gTask = 0;
     }
+    // v1.2.0 打开即刷新：保活只在后台期间有效，回到前台（点开图标）即退出进程，
+    // 用户这次点开看到的就是全新冷启动。冷启动不触发本回调，不会被误杀。
+    if (gReloadOnOpen && gActive) {
+        NSLog(@"[FUBG] reload-on-open: exiting for fresh relaunch");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ exit(0); });
+    }
 }
 
 static void FUBG_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
@@ -642,9 +660,9 @@ static void FUBGEntry(void) {
         if (obInt)   [gObs addObject:obInt];
         if (obRoute) [gObs addObject:obRoute];
 
-        NSLog(@"[FUBG] v1.1.0-keepalive (based on SIOriginal v2.4.3) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v1.2.0-keepalive (based on SIOriginal v2.4.3) loaded in %@: active=%d scene=%d audio=%d reloadOnOpen=%d audioMode=%d%@",
               FUBG_bundleID().length ? FUBG_bundleID() : @"?",
-              gActive, gUseScene, gUseAudio, gHasAudioMode,
+              gActive, gUseScene, gUseAudio, gReloadOnOpen, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
     } @catch (NSException *e) {
         NSLog(@"[FUBG] keep-alive install failed (app unaffected): %@", e);
