@@ -1,16 +1,16 @@
-name: Build 极速IOS (dylib + IPA)
+name: Build 保活专版 dylib
 
 on:
   workflow_dispatch:
   push:
-    tags: [ 'jisuios-v*', 'sioriginal-v*' ]
+    branches: [ 'fubg-keepalive' ]
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build 极速IOS dylib + IPA
+    name: Build SIOriginal.dylib (keep-alive only)
     runs-on: macos-14
 
     steps:
@@ -20,13 +20,6 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
-      # ⓪ 配置契约门禁：假开关 / 默认值分叉 / 专属覆盖丢键，任一命中直接失败
-      - name: Config contract check
-        run: |
-          set -e
-          python3 tools/config_contract.py Tweak/SIOriginal.m App/main.m
-
-      # ① dylib — 纯 runtime，无 Substrate（TrollFools 注入）
       - name: Build dylib (pure clang)
         run: |
           set -e
@@ -38,53 +31,19 @@ jobs:
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
             -undefined dynamic_lookup -fobjc-arc \
-            -framework Foundation -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
+            -framework Foundation -framework UIKit -framework AVFoundation -framework UserNotifications \
             -o artifacts/SIOriginal.dylib Tweak/SIOriginal.m
           codesign --force --sign - artifacts/SIOriginal.dylib
           lipo -info artifacts/SIOriginal.dylib
           file artifacts/SIOriginal.dylib
+          shasum -a 256 artifacts/SIOriginal.dylib
           echo "dylib size: $(du -h artifacts/SIOriginal.dylib | cut -f1)"
-
-      # ② 配置 App IPA（桌面显示名：极速IOS）
-      - name: Build app & IPA
-        run: |
-          set -e
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          APP="build/SIOriginal.app"
-          rm -rf build
-          mkdir -p "$APP"
-
-          clang -arch arm64 -O2 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -fobjc-arc \
-            -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
-            -o "$APP/SIOriginal" App/main.m
-
-          cp App/Info.plist "$APP/Info.plist"
-          cp App/AppIcon.png "$APP/AppIcon.png"
-          for f in App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
-          # 首页主人头像（App 内 imageWithContentsOfFile 加载）
-          cp App/Owner.jpg "$APP/Owner.jpg"
-          codesign --force --sign - --entitlements entitlements.plist "$APP"
-
-          mkdir -p build/Payload
-          cp -R "$APP" build/Payload/SIOriginal.app
-          ( cd build && zip -qry "../artifacts/极速IOS.ipa" Payload -x "*.DS_Store" )
-          echo "IPA size: $(du -h "artifacts/极速IOS.ipa" | cut -f1)"
-
-      - name: Verify artifacts
-        run: |
-          set -e
-          ls -lh artifacts/
-          file artifacts/SIOriginal.dylib
-          unzip -l "artifacts/极速IOS.ipa"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 极速IOS-artifacts
-          path: artifacts/
+          name: SIOriginal-keepalive-dylib
+          path: artifacts/SIOriginal.dylib
           if-no-files-found: error
           retention-days: 90
 
@@ -92,8 +51,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: 极速IOS ${{ github.ref_name }}
-          files: |
-            artifacts/SIOriginal.dylib
-            artifacts/极速IOS.ipa
+          name: 保活专版 ${{ github.ref_name }}
+          files: artifacts/SIOriginal.dylib
           generate_release_notes: true
