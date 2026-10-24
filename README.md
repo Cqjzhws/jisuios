@@ -1,10 +1,34 @@
-# 极速IOS（原 SIOriginal）v2.4.3
+# 极速IOS（原 SIOriginal）v2.4.5
 
 iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
 - 配置 App 桌面名：**极速IOS**
 - dylib 文件名与 install_name 保持 `SIOriginal.dylib`（TrollFools 注入兼容，勿手动改名）
 - bundle id `com.local.sioriginal`、配置路径 `/var/Managed Preferences/mobile/com.apple.UIKit.plist`、热重载通知名均保持不变 —— 覆盖安装不会丢配置
+
+## v2.4.5 变更：保活补到 scene 层
+
+**症状**：通知栏有通知，但解锁进微信，聊天列表要过一会才显示消息内容（进程没被杀、没有启动画面）。
+
+**原因**：iOS 13 起 App 的生命周期由 `UIScene` 主导。v2.4.3 只伪装了
+`UIApplication.applicationState` 并吞了 FBS 的 backgrounding diff，但没有 hook
+`UIScene.activationState` —— 微信读到的仍是真实 `Background`，于是主动把长连接
+降级成推送通道；切回前台要重连、拉离线消息，列表才有内容。
+
+**修复**：新增 `UIScene.activationState` 伪装，假前台期间返回 `ForegroundActive`。
+边界与 `applicationState` 完全一致：
+
+| 场景 | 返回值 |
+| --- | --- |
+| 真正的后台工作线程（`.fts.` / `mainIndex` / `.index.` / `IndexQueue`） | 真实 `Background` |
+| 本 dylib 自身调用（插件内部找前台 windowScene） | 真实值 |
+| 其余（微信主线程 / 网络线程 / UI） | 假 `ForegroundActive` |
+
+后台线程白名单与 v2.4.3 的崩溃规避共用同一份实现，因此不会把
+`com.tencent.xin.fts.mainIndex` 那个空指针崩溃点重新暴露出来。
+
+统计浮层状态行新增 `场景✓` / `场景✗`，用于确认 scene 层 hook 是否真的装上了
+（未装时只伪装 applicationState 等于白做）。
 
 ## v2.4.3 变更：保活与崩溃的平衡点
 

@@ -1,4 +1,4 @@
-// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.3
+// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.5
 //
 // ===================== v2.3.1 保活打磨（三处，省电 / 可观测）=====================
 // 不碰保活机制本身，只改三件事：
@@ -558,6 +558,10 @@ static BOOL     gSafeBootEnabled = YES;   // plist 键 SafeBootEnabled，默认�
 // v2.3.2（外部审查 P1-1）：上一次成功吞掉 backgrounding scene diff 的时刻，
 // 用于统计状态行判断「场景伪装现在是否真的在工作」（而不是只看配置位）。
 static NSTimeInterval gSceneSwallowAt = 0;
+// v2.4.5：UIScene.activationState 伪装的安装状态。iOS 13+ 的 App（含微信）判生命周期
+// 读的是 scene 的激活态，而不是 UIApplication.applicationState —— 只伪装后者时，
+// 微信仍然知道自己在后台，于是主动把长连接降级成推送通道（表现为「进微信要等一会」）。
+static BOOL     gSceneStateHooked = NO;
 static BOOL     gSafeMode        = NO;    // 本次启动是否已进入安全模式
 static BOOL     gSafeArmed       = NO;    // 标记已写、尚未确认「健康」
 static int      gSafeCrashCount  = 0;     // 连续「未走到健康点」的启动次数
@@ -1570,6 +1574,9 @@ static NSString *SIO_statsStatusLine(void) {
                             (CACurrentMediaTime() - gSceneSwallowAt) < 600.0);
             [s appendString:(audioOK || sceneOK) ? @" · 保活✓" : @" · 保活✗"];
         }
+        // v2.4.5：scene 层伪装是否真的装上了。微信靠 UIScene.activationState 判前后台，
+        // 这一层没装时只伪装 applicationState 等于白做（长连接照样降级）。
+        if (gUseScene) [s appendString:gSceneStateHooked ? @" · 场景✓" : @" · 场景✗"];
     }
     if (gListHardGuarded) [s appendString:@" · 列表⛔硬保护"];
     if (gSelfFeelProtected) [s appendString:@" · 手感⛔跳过"];
@@ -2826,7 +2833,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.4.3 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.4.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3487,6 +3494,47 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
     return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
 }
 
+// ---- v2.4.5：UIScene.activationState 伪装 ----
+//
+// 为什么必须补这一层：iOS 13 起 App 的生命周期由 UIScene 主导，微信判断「我在不在前台」
+// 读的是 `UIScene.activationState`，而不是被我们 hook 过的 `UIApplication.applicationState`。
+// 只伪装后者时，微信照样知道自己在后台 → 主动把长连接降级成推送通道 → 解锁回来要重连、
+// 拉离线消息，才看得到列表内容（通知栏有通知，进列表却要等一会）。
+//
+// 与 applicationState 保持同一套边界：
+//   · 只在假前台（gUseScene && gPhysBg）期间伪装；
+//   · 后台工作线程（FTS 索引 / 主索引）拿到**真实** Background —— 这是 v2.4.3 掐掉
+//     微信 fts.mainIndex 空指针崩溃的关键，scene 层放开后这些线程若按前台路径走，
+//     同一个崩溃点会复现，所以两层必须共用同一份白名单；
+//   · 本 dylib 自身调用返回真实值，避免插件内部「找前台 windowScene」时误判。
+//
+// 性能：与 _fbg_appState 同策略——按调用点（返回地址）缓存，热路径两次指针比较。
+// 值固定为 ForegroundActive 或原实现结果，不依赖 self，因此单条目缓存是确定性的。
+static UISceneActivationState (*gOrigActivationState)(id, SEL);
+static void *gScLastRet = NULL;
+static UISceneActivationState gScLastVal = UISceneActivationStateUnattached;
+
+static UISceneActivationState _fbg_activationState(id self, SEL _cmd) {
+    if (!(gUseScene && gPhysBg))
+        return gOrigActivationState ? gOrigActivationState(self, _cmd) : UISceneActivationStateBackground;
+    if (_fbg_isBackgroundWorkerThread())
+        return gOrigActivationState ? gOrigActivationState(self, _cmd) : UISceneActivationStateBackground;
+    void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
+    if (ret != NULL && ret == gScLastRet) return gScLastVal;
+    BOOL selfCall = NO;
+    Dl_info info;
+    if (ret && dladdr(ret, &info) && info.dli_fname &&
+        strstr(info.dli_fname, "SIOriginal.dylib")) {
+        selfCall = YES;
+    }
+    UISceneActivationState v = selfCall
+        ? (gOrigActivationState ? gOrigActivationState(self, _cmd) : UISceneActivationStateBackground)
+        : UISceneActivationStateForegroundActive;
+    gScLastRet = ret;
+    gScLastVal = v;
+    return v;
+}
+
 // ---- 通知横幅伪装 ----
 // v2.1.11：orig 指针原来是**全局单例** gOrigWillPresent。
 // 若 App 先后设置两个不同类的 delegate，第二个会把第一个记录的 IMP 覆盖掉，
@@ -3589,6 +3637,22 @@ static void _fbg_installSceneHooks(void) {
             gOrigAppState = (UIApplicationState (*)(id, SEL))cur;
             method_setImplementation(stateM, (IMP)_fbg_appState);
         }
+    }
+
+    // v2.4.5：scene 层伪装。iOS 13+ 的 App 读 scene 激活态，这一层不补，
+    // applicationState 的伪装会被绕过（微信仍判后台 → 断长连接）。
+    Method scM = class_getInstanceMethod([UIScene class], @selector(activationState));
+    if (scM) {
+        IMP cur = method_getImplementation(scM);
+        if (cur != (IMP)_fbg_activationState) {
+            gOrigActivationState = (UISceneActivationState (*)(id, SEL))cur;
+            method_setImplementation(scM, (IMP)_fbg_activationState);
+        }
+        gSceneStateHooked = YES;
+        NSLog(@"[FUBG] scene activationState hook installed");
+    } else {
+        gSceneStateHooked = NO;
+        NSLog(@"[FUBG] UIScene activationState not found; scene-state spoof disabled");
     }
 
     Class unClass = [UNUserNotificationCenter class];
@@ -3882,7 +3946,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.4.3 (SIOriginal v2.4.3) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.4.5 (SIOriginal v2.4.5) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
