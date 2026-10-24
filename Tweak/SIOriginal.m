@@ -1,4 +1,12 @@
-// SIOriginal（显示名：极速IOS）— 保活专版 v1.0.0（基于 v2.4.3 精简）
+// SIOriginal（显示名：极速IOS）— 保活专版 v1.1.0（基于 v2.4.3 精简）
+//
+// ===================== v1.1.0 修复「切回微信重新加载」=====================
+// 根因：场景伪装吞掉 backgrounding diff 后，UIKit 可能不再发
+// UIApplicationDidEnterBackgroundNotification → gPhysBg 恒为 NO →
+// 音频断言/看门狗从未启动 → 微信后台被挂起杀掉 → 切回冷启动重新加载。
+// 修复：被吞的 backgrounding diff 本身就是最可靠的「已进后台」信号，
+// 吞 diff 的同时直接置 gPhysBg=YES 并启动音频断言+看门狗；
+// 同理在 foreground=Yes diff 通过时做前台收尾。进程内通知仍保留，双通道幂等。
 //
 // ===================== 本版定位 =====================
 // 只保留「真后台保活（FUBackground）」一个功能，其余全部删除：
@@ -203,6 +211,10 @@ static void FUBG_loadPref(void) {
 #pragma mark - 引擎一：场景伪装
 // 移植/修改自 ImmortalizerJailed main.m（GPLv3, Serge Alagon），致谢 @khanhduytran0
 
+// 前向声明：吞 diff 时要直接驱动音频兜底（v1.1.0 双通道保活信号）
+static void FUBG_onEnterBackground(NSNotification *note);
+static void FUBG_onEnterForeground(NSNotification *note);
+
 static void (*gOrigSceneUpdate)(id, SEL, id, id, id, id);
 
 // 由后台化 diff 的描述特征判断这是否是一条"让 App 退到后台"的场景更新
@@ -211,7 +223,8 @@ static BOOL FUBG_isBackgroundingDiff(NSString *desc) {
     if ([desc containsString:@"foreground = NotSet"] ||
         [desc containsString:@"foreground = No"] ||
         [desc containsString:@"foreground = BSSettingFlagNo"] ||
-        [desc containsString:@"foreground = NO"]) {
+        [desc containsString:@"foreground = NO"] ||
+        [desc containsString:@"foreground = 0"]) {
         return YES;
     }
     // 后台切换器快照相关更新同样吞掉，避免快照暴露/状态推进
@@ -227,9 +240,23 @@ static BOOL FUBG_isBackgroundingDiff(NSString *desc) {
 static void FUBG_sceneUpdate(id self, SEL _cmd, id arg1, id arg2, id arg3, id arg4) {
     if (gUseScene) {
         @try {
-            if (FUBG_isBackgroundingDiff([arg2 description])) {
+            NSString *desc = [arg2 description];
+            if (FUBG_isBackgroundingDiff(desc)) {
                 NSLog(@"[FUBG] swallowed backgrounding scene diff");
+                // v1.1.0：被吞的 diff 就是「已进后台」信号——直接启动音频兜底，
+                // 不等 UIApplicationDidEnterBackgroundNotification（它可能因吞 diff 不发）。
+                if (!gPhysBg) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        FUBG_onEnterBackground(nil);
+                    });
+                }
                 return;
+            }
+            // 前台化 diff 正常放行；同时做前台收尾（与通知通道幂等）
+            if (gPhysBg && [desc containsString:@"foreground = Yes"]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    FUBG_onEnterForeground(nil);
+                });
             }
         } @catch (__unused NSException *e) {}
     }
@@ -615,7 +642,7 @@ static void FUBGEntry(void) {
         if (obInt)   [gObs addObject:obInt];
         if (obRoute) [gObs addObject:obRoute];
 
-        NSLog(@"[FUBG] v1.0.0-keepalive (based on SIOriginal v2.4.3) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v1.1.0-keepalive (based on SIOriginal v2.4.3) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               FUBG_bundleID().length ? FUBG_bundleID() : @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
