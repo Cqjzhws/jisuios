@@ -1,4 +1,4 @@
-// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.5
+// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.6
 //
 // ===================== v2.3.1 保活打磨（三处，省电 / 可观测）=====================
 // 不碰保活机制本身，只改三件事：
@@ -814,9 +814,11 @@ static BOOL SIO_fbgBuiltinExcluded(void) {
 // （delaysContentTouches、decelerationRate）来正确识别长按/选择等手势。
 // 整个手感模块（FastScroll + FastTap + setter 强黏）对这些 App 全部跳过。
 static BOOL SIO_feelProtected(void) {
-    // v2.1.14：移除 com.sfic.knight 的硬编码跳过（原 v2.1.8 逻辑，见下方历史注释）。
-    // 该 App 的手感模块现已按全局开关/专属覆盖正常生效；若抢单体验变差，把上面那行加回即可。
-    // ---- v2.1.8 历史注释（保留作风险记录，不再生效）----
+    // v2.4.6：把 com.sfic.knight 加回内置名单。用户实测反馈：骑士大厅下拉来回滑动
+    // 明显变「慢」——FastScroll 把 decelerationRate 锁成 Fast（0.99），每次滑动滑行
+    // 距离被大幅压缩，来回翻看要反复拨动。恢复该 App 的原生滚动惯性（整个手感模块
+    // 跳过：FastScroll + FastTap + setter 强黏）。
+    // ---- v2.1.8 历史注释（保留作风险记录）----
     // SF intracity rider (com.sfic.knight) order hall needs full native scroll inertia.
     // FastScroll locks decelerationRate to 0.99 (fast), which cut each swipe to one or
     // two order cells ("one cell at a time" feel). Skip the whole feel module for this
@@ -830,6 +832,7 @@ static BOOL SIO_feelProtected(void) {
             @"com.tencent.mqq",       // QQ：长按消息复制
             @"com.apple.mobilesms",   // 信息：长按复制
             @"com.tencent.wework",    // 企业微信：长按复制
+            @"com.sfic.knight",       // v2.4.6：顺丰骑士大厅需要原生滚动惯性
         ];
     });
     NSString *bid = SIO_bundleID();
@@ -2833,7 +2836,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.4.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.4.6 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3946,7 +3949,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.4.5 (SIOriginal v2.4.5) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.4.6 (SIOriginal v2.4.6) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

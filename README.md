@@ -1,10 +1,22 @@
-# 极速IOS（原 SIOriginal）v2.4.5
+# 极速IOS（原 SIOriginal）v2.4.6
 
 iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
 - 配置 App 桌面名：**极速IOS**
 - dylib 文件名与 install_name 保持 `SIOriginal.dylib`（TrollFools 注入兼容，勿手动改名）
 - bundle id `com.local.sioriginal`、配置路径 `/var/Managed Preferences/mobile/com.apple.UIKit.plist`、热重载通知名均保持不变 —— 覆盖安装不会丢配置
+
+## v2.4.6 变更：顺丰骑士恢复原生滑动
+
+**症状**：顺丰骑士（com.sfic.knight）大厅下拉来回滑动明显变「慢」，要反复拨动。
+
+**原因**：手感模块的 FastScroll 会把 `UIScrollView.decelerationRate` 锁成
+`Fast`（0.99），每次滑动的滑行距离被大幅压缩。v2.1.14 曾按当时要求把骑士从
+手感保护名单移除，本次实测确认大厅场景必须保留原生滚动惯性。
+
+**修复**：把 `com.sfic.knight` 加回内置手感保护名单（整个手感模块跳过：
+FastScroll + FastTap + setter 强黏），动画加速不受影响。App 侧「手感保护」
+说明文字同步更新。
 
 ## v2.4.5 变更：保活补到 scene 层
 
