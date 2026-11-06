@@ -1,4 +1,4 @@
-// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.6
+// SIOriginal（显示名：极速IOS）— 原版重制                        v2.4.7
 //
 // ===================== v2.3.1 保活打磨（三处，省电 / 可观测）=====================
 // 不碰保活机制本身，只改三件事：
@@ -2836,7 +2836,7 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v2.0.0：追加 floor/transBoost/longPress/notify 四个新引擎参数
-    NSLog(@"[SIOriginal] v2.4.6 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
+    NSLog(@"[SIOriginal] v2.4.7 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f transBoost=%.1f floor=%.3f spring=%d extra=%d list=%d zoom=%d feel=%d/%d notify=%d instant=%d hud=%d/%.2fs wk=%d override=%d listGuard=%d hudGuard=%d feelGuard=%d safeMode=%d crash=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gTransBoost, gFloorDuration,
           gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gInAppNotify,
@@ -3355,11 +3355,35 @@ static BOOL _fbg_isBackgroundWorkerThread(void) {
     return hit;
 }
 
+// ---- v2.4.7：音频保活的硬排除名单 ----
+//
+// 与场景伪装的白名单不是一回事，两边独立：
+//   · 这里命中的 App **只关音频断言**，场景伪装照旧 → 后台保活不受影响；
+//   · 想连保活一起关，用 Blacklist（_fbg_isExcluded）。
+//
+// 为什么要有这张表：音频断言干的事是在目标 App 的进程里 setCategory:Playback +
+// setActive:YES 再循环播一段静音白噪。对「自己全程占着音频会话」的 App，这就是
+// 硬插一脚 —— 它们本来就在 Playback 上放视频，插件再激活一次、再塞一个 player，
+// 结果是会话状态被反复改写：切后台回来视频没声音、要重播一遍、蓝牙路由切不回来。
+// 这类 App 靠场景伪装（假前台）已经能保住后台，音频那层纯属负收益。
+static BOOL _fbg_audioHardExcluded(void) {
+    static NSArray *list = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        list = @[
+            @"com.ss.iphone.ugc.Aweme",   // 抖音：短视频全程占用音频会话，勿再叠加静音白噪
+        ];
+    });
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return bid.length && [list containsObject:bid];
+}
+
 static void _fbg_recalc(void) {
     BOOL wasScene = gUseScene;
     gActive   = gFUBGEnabled && !_fbg_isExcluded();
     gUseScene = gActive && gSceneFake;
-    gUseAudio = gActive && gAudioKeep;
+    // v2.4.7：音频断言额外受硬排除名单约束；场景伪装不看这张表。
+    gUseAudio = gActive && gAudioKeep && !_fbg_audioHardExcluded();
     // v2.3.3（审查 P2）：场景伪装关闭时清零上次吞 diff 时间戳，
     // 避免状态行把"很久以前工作过"误判为"近期仍在工作"。
     if (!gUseScene && wasScene) gSceneSwallowAt = 0;
@@ -3949,7 +3973,7 @@ static void FUBGEntry(void) {
 
         // v2.1.11：看门狗不再在这里无条件安装，改为进入后台时才装（见 _fbg_watchdogStart）。
 
-        NSLog(@"[FUBG] v2.4.6 (SIOriginal v2.4.6) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.4.7 (SIOriginal v2.4.7) loaded in %@: active=%d scene=%d audio=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

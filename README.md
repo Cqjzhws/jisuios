@@ -1,10 +1,28 @@
-# 极速IOS（原 SIOriginal）v2.4.6
+# 极速IOS（原 SIOriginal）v2.4.7
 
 iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
 - 配置 App 桌面名：**极速IOS**
 - dylib 文件名与 install_name 保持 `SIOriginal.dylib`（TrollFools 注入兼容，勿手动改名）
 - bundle id `com.local.sioriginal`、配置路径 `/var/Managed Preferences/mobile/com.apple.UIKit.plist`、热重载通知名均保持不变 —— 覆盖安装不会丢配置
+
+## v2.4.7 变更：抖音不吃音频保活
+
+**症状**：抖音（`com.ss.iphone.ugc.Aweme`）在后台保活期间，切回来视频没声音或要重播一遍。
+
+**原因**：音频断言会在目标进程里 `setCategory:Playback` + `setActive:YES`，再循环播一段
+静音白噪。抖音自己全程占着音频会话，插件再激活一次、再塞一个 player，等于在它的
+session 上反复改写状态 —— 后台回来路由没切回、播放器被判失效。
+
+**修复**：新增音频保活硬排除名单 `_fbg_audioHardExcluded()`：
+
+```c
+gUseAudio = gActive && gAudioKeep && !_fbg_audioHardExcluded();
+```
+
+抖音只关音频断言，**场景伪装（假前台）照旧** —— 后台保活不受影响，`scene=1 audio=0`。
+以后遇到同样「自己就是音频重灾区」的 App（直播、音乐、通话类），把这个表加一条即可，
+不用动其他逻辑。
 
 ## v2.4.6 变更：顺丰骑士恢复原生滑动
 
