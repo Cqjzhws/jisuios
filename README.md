@@ -1,10 +1,17 @@
-# 极速IOS（原 SIOriginal）v2.5.0
+# 极速IOS（原 SIOriginal）v2.5.1
 
 iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
 - 配置 App 桌面名：**极速IOS**
 - dylib 文件名与 install_name 保持 `SIOriginal.dylib`（TrollFools 注入兼容，勿手动改名）
 - bundle id `com.local.sioriginal`、配置路径 `/var/Managed Preferences/mobile/com.apple.UIKit.plist`、热重载通知名均保持不变 —— 覆盖安装不会丢配置
+
+## v2.5.2 变更：构建链路脱离 macOS runner
+
+代码与 v2.5.1 一致，只换构建机：`macos-14` → `ubuntu-latest` + zig 0.13.0 交叉编译，
+签名改走 `tools/adhoc_sign.py`。原因见文末「构建」一节：macOS runner 被账号层拦截，
+两次运行都是 0 步骤直接取消。原 macOS workflow 保留为 `build-macos.yml`（手动触发）。
+已验证产物：dylib/App 均为 `platform=iOS 14.0`、依赖指向设备路径、签名与 entitlements 完整。
 
 ## v2.5.0 变更：抖音不保活 + 三个真缺陷 + 性能 + 美术七条
 
@@ -264,19 +271,56 @@ python tools/adhoc_sign.py Payload/SIOriginal.app/SIOriginal SIOriginal entitlem
 
 ## 构建
 
-推 `jisuios-v*` 或 `sioriginal-v*` tag，或手动 `workflow_dispatch` 触发 `build.yml`（macos-14 / Xcode）。
+推 `jisuios-v*` 或 `sioriginal-v*` tag，或手动 `workflow_dispatch` 触发 `build.yml`。
+
+**v2.5.2 起构建机换成 `ubuntu-latest` + zig 交叉编译**（原来的 `macos-14` 方案保留为
+`build-macos.yml`，仅手动触发）。原因：#73（11-06）、#74（11-10）两次运行都是
+`cancelled` 且 **runner 为空、steps=0、日志压缩包 0 个文件**，属账号/计费层的 macOS
+runner 拦截，与代码无关。ubuntu 对公开仓库免费，不受 macOS 额度影响。
+
+关键约束，改 workflow 时别踩：
+
+- `ziglang` 必须钉版本（`==0.13.0`）。0.17.x 在 `-target aarch64-ios` 下直接段错误 exit 139。
+- 链接一律加 `-Wl,-headerpad,0x4000`。`tools/adhoc_sign.py` 要在 load commands 尾部插
+  `LC_CODE_SIGNATURE`，没有 headerpad 就没地方放；顺带把 `__text` 推离文件头首页，
+  这是之前真机「跳到段首函数 SIGILL」的根因。
+- 签名用 `tools/adhoc_sign.py`（纯 Python 构造 CodeDirectory + entitlements），
+  等价于 macOS 上的 `codesign -s - --entitlements`，TrollStore 能读出 entitlements。
+- `-Wl,-install_name,@rpath/SIOriginal.dylib` 别写成 `-install_name`（zig 不认 clang 那个驱动参数）。
+- 产物校验：`SIOriginal.dylib` 与 App 主二进制都必须是 `LC_BUILD_VERSION platform=iOS`，
+  依赖必须是 `/System/Library/...` 设备路径 —— 指向 SDK 路径装到手机上必崩。
 
 产物：`SIOriginal.dylib`（TrollFools 注入）+ `极速IOS.ipa`（TrollStore 安装）。
+注意 GitHub Release 会剥掉资产名里的中文，上传后需要手动改名成 `JisuIOS-vX.Y.Z.ipa`。
 
-本地复现：
+本地复现（macOS）：
 
 ```bash
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 clang -arch arm64 -dynamiclib -O2 -install_name @rpath/SIOriginal.dylib \
   -isysroot "$SDK" -miphoneos-version-min=14.0 -undefined dynamic_lookup -fobjc-arc \
+  -Wl,-headerpad,0x4000 \
   -framework Foundation -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
   -o SIOriginal.dylib Tweak/SIOriginal.m
 ```
+
+本地复现（任意平台，zig 交叉）：
+
+```bash
+pip install "ziglang==0.13.0"
+curl -fL -o /tmp/sdk.tar.xz \
+  https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+mkdir -p ~/sdk && tar -xJf /tmp/sdk.tar.xz -C ~/sdk
+SDK=~/sdk/iPhoneOS16.5.sdk
+python -m ziglang cc -target aarch64-ios.14.0 -isysroot "$SDK" -isystem "$SDK/usr/include" \
+  -F "$SDK/System/Library/Frameworks" -fobjc-arc -fblocks -O2 -shared \
+  -Wl,-install_name,@rpath/SIOriginal.dylib -Wl,-headerpad,0x4000 -Wl,-undefined,dynamic_lookup \
+  -L "$SDK/usr/lib" -framework Foundation -framework UIKit -framework QuartzCore \
+  -framework CoreGraphics -framework AVFoundation -framework UserNotifications -lobjc \
+  -o SIOriginal.dylib Tweak/SIOriginal.m
+python tools/adhoc_sign.py SIOriginal.dylib com.local.sioriginal.dylib entitlements.plist
+```
+
 
 ## 运行时配置
 
