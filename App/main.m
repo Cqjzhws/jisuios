@@ -1044,6 +1044,17 @@ static UILabel *SIOLabel(NSString *t, CGFloat size, UIColor *color) {
 }
 
 // 带副标题的开关行：主标题 16pt + 12pt 灰色说明，右侧控件
+// 行内「占位弹簧」：把 ctrl 顶到行尾（v2.5.7）
+// 原来只靠 label 的低 hugging 去撑开，一旦 label 被压缩或被栈的 alignment 影响，
+// 开关就会停在文字后面、右边缘留一大片空白（真机实测右边缘空约 120pt）。
+// 放一个 hugging/压缩阻力都最低的空视图，由它吃掉所有多余宽度，开关必然贴右。
+static UIView *SIORowSpacer(void) {
+    UIView *sp = [[UIView alloc] init];
+    [sp setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+    [sp setContentCompressionResistancePriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+    return sp;
+}
+
 static UIView *SIORowSub(NSString *title, NSString *subtitle, UIView *ctrl) {
     UILabel *l = SIOLabel(title, 16, SIOTextPri());
     l.font = SIOFont(16, UIFontWeightMedium);
@@ -1055,7 +1066,7 @@ static UIView *SIORowSub(NSString *title, NSString *subtitle, UIView *ctrl) {
         [v addArrangedSubview:s];
     }
     [v setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
-    UIStackView *h = [[UIStackView alloc] initWithArrangedSubviews:@[ v, ctrl ]];
+    UIStackView *h = [[UIStackView alloc] initWithArrangedSubviews:@[ v, SIORowSpacer(), ctrl ]];
     h.axis = UILayoutConstraintAxisHorizontal;
     h.alignment = UIStackViewAlignmentCenter;
     h.spacing = 12;
@@ -1067,7 +1078,7 @@ static UIView *SIORow(NSString *title, UIView *ctrl, UIColor *titleColor) {
     UILabel *l = SIOLabel(title, 16, titleColor);
     l.font = SIOFont(16, UIFontWeightMedium);
     [l setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
-    UIStackView *h = [[UIStackView alloc] initWithArrangedSubviews:@[ l, ctrl ]];
+    UIStackView *h = [[UIStackView alloc] initWithArrangedSubviews:@[ l, SIORowSpacer(), ctrl ]];
     h.axis = UILayoutConstraintAxisHorizontal;
     h.alignment = UIStackViewAlignmentCenter;
     h.spacing = 12;
@@ -1080,9 +1091,19 @@ static UIView *SIOCard(NSArray<UIView *> *items, CGFloat spacing) {
     card.elevated = YES;
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:items];
     st.axis = UILayoutConstraintAxisVertical;
+    st.alignment = UIStackViewAlignmentFill;
     st.spacing = spacing;
     st.translatesAutoresizingMaskIntoConstraints = NO;
     [card.contentView addSubview:st];
+    // v2.5.7：逐项钉死宽度。
+    // 真机实测：这一版里行只到开关右边就结束，右侧空出约 120pt，而分段控件是通栏的，
+    // 于是同一张卡里出现两种右边距（截图里被圈出来的就是它）。
+    // 只依赖 UIStackView 的默认 fill 在这里没有生效（alignment 明明是 fill），
+    // 所以改成显式约束：每个 arrangedSubview 的宽度 == 栈宽度，不再靠推断。
+    for (UIView *v in items) {
+        v.translatesAutoresizingMaskIntoConstraints = NO;
+        [v.widthAnchor constraintEqualToAnchor:st.widthAnchor].active = YES;
+    }
     [NSLayoutConstraint activateConstraints:@[
         [st.topAnchor constraintEqualToAnchor:card.contentView.topAnchor constant:16],
         [st.bottomAnchor constraintEqualToAnchor:card.contentView.bottomAnchor constant:-16],
