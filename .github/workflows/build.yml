@@ -130,9 +130,9 @@ jobs:
           cp App/Owner.jpg "$APP/Owner.jpg"
 
           # v2.5.5：签名交给 ldid（与 TrollStore 同款签名器），不再手写 CodeDirectory。
-          # entitlements 决定 App 有没有 no-sandbox / platform-application ——
-          # 没有这两项就写不进 /var/Managed Preferences，表现为「保存失败」。
-          "$LDID" -S entitlements.plist "$APP/SIOriginal"
+          # ⚠ entitlements 必须紧贴 -S 写成 -Sfile，写 `-S file` 会被当成「要签 file」，
+          #   然后报 "Unknown header magic"（v2.5.5 第一次构建就栽在这）。
+          "$LDID" -S"$PWD/entitlements.plist" "$APP/SIOriginal"
           chmod 755 "$APP/SIOriginal"
           file "$APP/SIOriginal"
 
