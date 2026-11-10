@@ -1,4 +1,4 @@
-# 极速IOS（原 SIOriginal）v2.4.7
+# 极速IOS（原 SIOriginal）v2.5.0
 
 iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
@@ -6,23 +6,72 @@ iOS 动画加速 + 手感 + 真后台保活。面向 iOS 14–17，适配 TrollS
 - dylib 文件名与 install_name 保持 `SIOriginal.dylib`（TrollFools 注入兼容，勿手动改名）
 - bundle id `com.local.sioriginal`、配置路径 `/var/Managed Preferences/mobile/com.apple.UIKit.plist`、热重载通知名均保持不变 —— 覆盖安装不会丢配置
 
-## v2.4.7 变更：抖音不吃音频保活
+## v2.5.0 变更：抖音不保活 + 三个真缺陷 + 性能 + 美术七条
 
-**症状**：抖音（`com.ss.iphone.ugc.Aweme`）在后台保活期间，切回来视频没声音或要重播一遍。
+### 1. 抖音家族不再参与「真后台」
 
-**原因**：音频断言会在目标进程里 `setCategory:Playback` + `setActive:YES`，再循环播一段
-静音白噪。抖音自己全程占着音频会话，插件再激活一次、再塞一个 player，等于在它的
-session 上反复改写状态 —— 后台回来路由没切回、播放器被判失效。
+口径是**精准排除**：只剔除保活，动画加速 / 手感 / HUD / 列表接管一概不动。
 
-**修复**：新增音频保活硬排除名单 `_fbg_audioHardExcluded()`：
+内置排除名单新增 `com.ss.iphone.ugc.*`（抖音 / 极速版 / 火山）与 `com.zhiliaoapp.musically*`（TikTok）。
+抖音进程里以下八项全部不执行：场景 diff 吞并、`applicationState` 伪装、`UIScene.activationState` 伪装、
+AVAudioSession 激活与白噪、后台任务桥、3s 看门狗、通知横幅伪装、UN delegate 二次挂钩。
 
-```c
-gUseAudio = gActive && gAudioKeep && !_fbg_audioHardExcluded();
+同时修掉一个「写了不生效」的坑：该名单原来用 `containsObject:` **精确比较**，带 `*` 的条目永远不命中
+（v2.1.18 统一个 `*` 前缀语义时漏了这一处）。现在改走 `SIO_bidInList()`。
+
+`_fbg_installSceneHooks()` 加了 `gActive` 短路：被排除的 App 连 4 个 method 替换都不做。
+
+验收：抖音启动日志出现
+`[FUBG] keep-alive not applicable in com.ss.iphone.ugc.Aweme — hooks skipped`；
+退后台 60s 再回，Console 无 `audio keep-alive started` / `watchdog started`。
+
+### 2. 三个真缺陷
+
+| ID | 症状 | 根因 | 位置 |
+| --- | --- | --- | --- |
+| B-1 | **App 在前台，后台任务线程被告知「你在后台」** | `_fbg_appState` 少了 `gPhysBg` 条件；`gUseScene` 在前台也是 YES。微信前台建全文索引会走后台分支 | `_fbg_appState` |
+| B-2 | 某条线程从此永远认为自己「在后台」 | 后台线程判定用 `__thread` 缓存**布尔结果**，GCD 线程复用后缓存失效。改为缓存 queue label 指针 | `_fbg_isBackgroundWorkerThread` |
+| B-3 | 转场倍率 ×1.5/×2/×3 调了没反应 | `InstantTransition` 默认开时 `SIO_transitionDuration` 直接返回时长下限，倍率那步走不到。现在界面灰掉并说明原因 | `SIOModel refreshDynamicLabels` |
+
+### 3. 性能（都是「少做一次昂贵的事」）
+
+- **配置只解析一次**：`SIO_reload` 与 `_fbg_loadPref` 本来各读一次同一个 plist。
+  新增 `SIO_prefSnapshot()`（`os_unfair_lock` + 2s TTL），热重载入口显式失效。
+- **显式动画关联表 3 次 → 1 次**：`SIODoubleBox` 把「原时长 + 已缩放标记」装进一个盒子，
+  不再用两个独立关联键（`objc_get/setAssociatedObject` 走同一张全局自旋锁）。
+- **微信放大态探测移出动画栈**：原来 `SIO_blocked()`（所有 hook 第一行）在 0.35s 节流下
+  同步 DFS 最多 1500 个节点 —— 本项目唯一会主动掉帧的地方。现在排队到下一轮 runloop，
+  节流放宽到 2s；双击放大走 `setZoomScale:` 时直接置位，不必等探测。
+- **列表 hook 撤掉 4 个非动画方法**：`reloadData`（TV/CV）、`performBatchUpdates`、
+  `reloadSections`（CV）。它们包 `CATransaction` 只会强制同步提交、让隐式布局动画吃到 5ms 时长，
+  重列表 App 上是负优化。保留 `select/deselect/scrollTo` 等真会产生滚动动画的方法。
+- **App 侧**：`ReadConfig()` 加 `gCfgSnapshot`（切 Tab 不再反复读盘）；
+  `WriteConfig(cfg, dragCoeff)` 把 `UIAnimationDragCoefficient` 合并进同一次写盘
+  （原来一次保存对同一文件写两轮）。
+
+### 4. 美术七条（材质规范，逐条可验收）
+
+| # | 条款 | 本次落地 |
+| --- | --- | --- |
+| 1 | 单一光源 | 卡片补下缘背光（上亮下暗），左右内缩 26pt 避开圆角 |
+| 2 | 材质最多三层 | 玻璃上禁止再叠模糊，注释锁定 |
+| 3 | 同心圆角 | 新增 `SIOInnerRadius(outer, inset)`；输入框/报告框 14 → 10（= 26 − 16） |
+| 4 | 对比度 ≥4.5:1 | `SIOTextTer` 浅色 (0.44,0.51,0.48) → (0.38,0.44,0.42)，实测 3.72:1 → 4.76:1 |
+| 5 | 模糊可降级 | 读 `UIAccessibilityIsReduceTransparencyEnabled()`；`SIOGlassEffect` 缓存实例 + effect 去重 |
+| 6 | 暗色有底 | 光斑下限 0.34/0.26/0.19、底色非纯黑，注释锁定 |
+| 7 | 动效同曲 | `SIO_PRESS_IN/OUT/SCALE/TAB_SCALE` 四常量，清掉散落魔数 |
+
+### 5. 门禁状态
+
+```
+python tools/static_check.py .                                  # 0 问题
+python tools/config_contract.py Tweak/SIOriginal.m App/main.m   # 契约干净
+python tools/check_v250.py .                                    # 12 条 → 6 条
 ```
 
-抖音只关音频断言，**场景伪装（假前台）照旧** —— 后台保活不受影响，`scene=1 audio=0`。
-以后遇到同样「自己就是音频重灾区」的 App（直播、音乐、通话类），把这个表加一条即可，
-不用动其他逻辑。
+`check_v250` 剩余 6 条与本次改动无关：V250-2 / V250-7 属于另一套 v2.5.0 方案里
+尚未实现的功能（`SIO_installLayerCoreHooks` / `gImplicitActionDur`），
+V250-4 是 watchdog 函数命名与调用位置和该脚本假设的代码组织不同（实际成对启停正常）。
 
 ## v2.4.6 变更：顺丰骑士恢复原生滑动
 

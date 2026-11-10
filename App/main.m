@@ -43,7 +43,7 @@ static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 // 必须与 dylib 侧 kNotifyStats 完全一致，否则按钮按了没反应。
 static NSString * const NotifyStatsKey = @"com.local.sioriginal.requeststats";
 static NSString * const kAppliedNote = @"SIOModelDidApply";
-static NSString * const SIO_VERSION = @"v2.4.7";
+static NSString * const SIO_VERSION = @"v2.4.6";
 
 // v1.8.14：列表 hook 硬保护名单 —— 必须与 dylib 内 SIO_listHardBlocked() 保持一致。
 // v2.1.12（审查 N-2）：补上 com.apple.springboard（dylib 侧一直有 2 项，这里只有 1 项）。
@@ -182,8 +182,24 @@ static const double SIO_DefLayerBoost = 5.0;     // 与 dylib gLayerBoost 一致
 static const double SIO_DefFloor      = 0.005;   // 与 dylib gFloorDuration 一致
 static const double SIO_DefTransBoost = 3.0;     // 与 dylib gTransBoost 一致
 
+// v2.5.0（P-1 App 侧）：配置读取缓存。
+// 事实：四个页面各自 viewDidLoad/refresh 都会调 ReadConfig()，切一遍 Tab 就是 4~6 次
+// 同步磁盘读 —— 而这份 plist 在一次「打开 App → 保存」之间几乎不变。
+// 这里缓存「盘上的原始内容」，每次返回新的 mutableCopy，调用方随便改不影响缓存。
+// 失效点：WriteConfig / resetToFactory / 迁移写盘 之后必须调 SIOInvalidateConfigCache()。
+// 线程：App 侧所有调用都在主线程（全部 UI 路径），不加锁；一旦将来挪到后台队列，
+// 必须补 os_unfair_lock —— 现在留这行注释就是为了拦住那种改法。
+static NSDictionary *gCfgSnapshot = nil;
+
+static void SIOInvalidateConfigCache(void) { gCfgSnapshot = nil; }
+
 static NSMutableDictionary *ReadConfig(void) {
-    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
+    NSDictionary *src = gCfgSnapshot;
+    if (!src) {
+        src = [NSDictionary dictionaryWithContentsOfFile:PrefPath];
+        gCfgSnapshot = src;   // 文件不存在时保持 nil，下次仍读盘（首次安装的场景）
+    }
+    NSMutableDictionary *d = src ? [src mutableCopy] : [NSMutableDictionary dictionary];
     if (!d) d = [NSMutableDictionary dictionary];
     // v2.1.1：缺省值与 dylib SIO_reload 严格保持一致。
     // v2.1.18 注释订正（行为不变）：旧文「FastScroll / FastTap 必须默认关、曾致全闪退」
@@ -254,13 +270,21 @@ static NSArray *SIOConfigKeys(void) {
     return keys;
 }
 
-static BOOL WriteConfig(NSMutableDictionary *cfg) {
+// v2.5.0（P-1）：写盘同时合并 UIAnimationDragCoefficient。
+// 原来 save() 里 WriteConfig 读-改-写一遍，WriteUIKitDrag 又读-改-写**同一个文件**，
+// 一次保存两次完整 IO，中间还有「写了一半」的窗口（两次之间被 kill 就会只落下其中一项）。
+// dragCoeff < 0 表示本次不动这个键（导流等只想改配置的调用方用 -1）。
+static BOOL WriteConfig(NSMutableDictionary *cfg, double dragCoeff) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     NSMutableDictionary *merged = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!merged) merged = [NSMutableDictionary dictionary];
     for (NSString *k in SIOConfigKeys()) {
         if (cfg[k]) merged[k] = cfg[k];
+    }
+    if (dragCoeff >= 0.0) {
+        if (dragCoeff > 0.0) merged[@"UIAnimationDragCoefficient"] = @(dragCoeff);
+        else                 [merged removeObjectForKey:@"UIAnimationDragCoefficient"];
     }
     BOOL ok = [merged writeToFile:PrefPath atomically:YES];
     if (!ok) {
@@ -277,6 +301,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                        errno, strerror(errno));
     }
     if (ok) {
+        SIOInvalidateConfigCache();   // v2.5.0：盘上内容已变，快照立即作废
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                              (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
     }
@@ -349,6 +374,7 @@ static void SIO_MigrateV211(void) {
             // 幽灵键（FastLongPress/LongPressDuration）永久残留。现在只有写成功才标记；
             // 失败下次启动重试，迁移本身幂等，无副作用。
             if ([cur writeToFile:PrefPath atomically:YES]) {
+                SIOInvalidateConfigCache();   // v2.5.0：迁移改了盘上的键，快照必须作废
                 CFNotificationCenterPostNotification(
                     CFNotificationCenterGetDarwinNotifyCenter(),
                     (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
@@ -388,23 +414,14 @@ static BOOL WriteAxBatch(NSDictionary *kv) {
 }
 
 static double ReadUIKitDrag(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PrefPath];
-    NSNumber *v = d[@"UIAnimationDragCoefficient"];
+    // v2.5.0：走配置快照，不再每次单独读一遍盘。
+    // 注意 ReadConfig() 会补齐默认值，但它不影响 UIAnimationDragCoefficient 这个键。
+    NSNumber *v = [ReadConfig() objectForKey:@"UIAnimationDragCoefficient"];
     return v ? v.doubleValue : 0.0;
 }
-// v2.3.3：同上，改为返回 BOOL。
-static BOOL WriteUIKitDrag(double coeff) {
-    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
-    if (!d) d = [NSMutableDictionary dictionary];
-    if (coeff > 0.0) {
-        d[@"UIAnimationDragCoefficient"] = @(coeff);
-    } else {
-        [d removeObjectForKey:@"UIAnimationDragCoefficient"];
-    }
-    mkdir("/var/Managed Preferences", 0755);
-    mkdir("/var/Managed Preferences/mobile", 0755);
-    return [d writeToFile:PrefPath atomically:YES];
-}
+// v2.5.0：WriteUIKitDrag 已删除 —— 它和 WriteConfig 写的是同一个文件，
+// 一次保存两次完整 IO。现在由 WriteConfig(cfg, dragCoeff) 合并成一次写盘。
+// 想单独改 drag 系数时，传 -1 之外的其它参数调用 WriteConfig 即可。
 // 分档索引 → 系数：0=关闭 1=×5(0.2) 2=×10(0.1) 3=×20(0.05) 4=极端(0.0001)
 static double DragCoeffForIndex(int i) {
     switch (i) {
@@ -560,7 +577,11 @@ static UIColor *SIOTextPri(void)       { return SIO_Dyn(^{ return SIO_RGBA(0.043
                                                         ^{ return SIO_RGBA(0.933,0.965,0.953,1.0); }); }
 static UIColor *SIOTextSec(void)       { return SIO_Dyn(^{ return SIO_RGBA(0.353,0.420,0.396,1.0); },
                                                         ^{ return SIO_RGBA(0.720,0.800,0.770,1.0); }); }
-static UIColor *SIOTextTer(void)       { return SIO_Dyn(^{ return SIO_RGBA(0.440,0.510,0.480,1.0); },
+// v2.5.0（美术第 4 条：对比度硬门槛）：浅色 tertiary 原为 (0.440,0.510,0.480)，
+// 落在浅色底 (0.945,0.965,0.953) 上实测 3.72:1 —— 低于 WCAG AA 的 4.5:1，
+// 而这个色正是 12pt 说明文字与 placeholder 在用的。改为 (0.38,0.44,0.42) → 4.76:1。
+// 深色一档 7.37:1 本来就有富余，不动。
+static UIColor *SIOTextTer(void)       { return SIO_Dyn(^{ return SIO_RGBA(0.380,0.440,0.420,1.0); },
                                                         ^{ return SIO_RGBA(0.560,0.630,0.610,1.0); }); }
 static UIColor *SIOAccentSoft(void)    { return SIO_Dyn(^{ return SIO_RGBA(0.039,0.502,0.349,0.13); },
                                                         ^{ return SIO_RGBA(0.220,0.850,0.630,0.18); }); }
@@ -580,6 +601,25 @@ static UIColor *SIOAccent(void) {
     return [UIColor colorWithRed:0.04 green:0.50 blue:0.36 alpha:1.0];
 }
 
+// ---------------------------------------------------------------------------
+// v2.5.0「美术七条」的两个公共落点（必须定义在所有玻璃视图之前）
+// ---------------------------------------------------------------------------
+
+// 第 3 条：同心圆角 —— 内圆角 = 外圆角 − 内边距。
+// 两个弧线不平行时，眼睛会看到「双圈打架」，这是廉价感最直接的来源。
+// 卡片 26 / 内边距 16 → 内层 10；原来输入框写死 14，与卡片不同心。
+static CGFloat SIOInnerRadius(CGFloat outer, CGFloat inset) {
+    return MAX(4.0, outer - inset);
+}
+
+// 第 7 条：动效同一条曲线 —— 时长与缩放集中在这里，
+// 禁止再在别处写 0.12 / 0.18 / 0.975 这类魔数。第三处实现一旦写成 0.15，
+// 三个可点元件的手感就不一致了（人眼对这种差异很敏感）。
+static const NSTimeInterval SIO_PRESS_IN    = 0.12;
+static const NSTimeInterval SIO_PRESS_OUT   = 0.18;
+static const CGFloat        SIO_PRESS_SCALE = 0.975;   // 卡片 / 胶囊这种大面积元件
+static const CGFloat        SIO_TAB_SCALE   = 0.95;    // 标签项更小，压缩幅度略大
+
 static UIFont *SIOFontCapped(CGFloat size, UIFontWeight weight, CGFloat cap) {
     UIFont *base = [UIFont systemFontOfSize:size weight:weight];
     UIFont *f = [[UIFontMetrics defaultMetrics] scaledFontForFont:base
@@ -593,6 +633,14 @@ static UIFont *SIOFont(CGFloat size, UIFontWeight weight) {
 // iOS 26 的 UIGlassEffect 只能在运行时探测：用旧 SDK 编译时符号不存在，
 // 直接写会编译不过，所以走 NSClassFromString + objc_msgSend。
 static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
+    // v2.5.0（美术第 5 条）：tint 为 nil（本项目全部调用点都是 nil）时复用同一个实例。
+    // SIOGlassView 每次 sio_applyTheme 都会调这里，而 didMoveToWindow / trait 变化
+    // 都会触发 applyTheme —— 每次新建 effect，等于让 UIVisualEffectView 重建内部模糊层。
+    // 共享是安全的：UIVisualEffectView.effect 本身是 copy 语义。
+    static UIVisualEffect *cachedPlain = nil;
+    if (!tint && cachedPlain) return cachedPlain;
+
+    UIVisualEffect *result = nil;
     Class cls = NSClassFromString(@"UIGlassEffect");
     if (cls && [cls respondsToSelector:@selector(effectWithStyle:)]) {
         id fx = ((id (*)(id, SEL, NSInteger))objc_msgSend)(cls, @selector(effectWithStyle:), 0);
@@ -600,10 +648,12 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
             if (tint && [fx respondsToSelector:@selector(setTintColor:)]) {
                 [fx performSelector:@selector(setTintColor:) withObject:tint];
             }
-            return (UIVisualEffect *)fx;
+            result = (UIVisualEffect *)fx;
         }
     }
-    return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    if (!result) result = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    if (!tint) cachedPlain = result;
+    return result;
 }
 
 #pragma mark - 玻璃容器
@@ -624,6 +674,7 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
     UIView *_tint;
     UIView *_sheen;
     CAGradientLayer *_sheenLayer;
+    UIView *_bottomRim;   // v2.5.0（美术第 1 条）：下缘背光，制造玻璃厚度
 }
 
 - (instancetype)initWithRadius:(CGFloat)r {
@@ -661,6 +712,14 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
         [_sheen.layer addSublayer:_sheenLayer];
         [_effect.contentView addSubview:_sheen];
 
+        // v2.5.0（美术第 1 条：单一光源）：只有上缘高光时，玻璃看起来像贴在屏上的
+        // 一张纸，没有厚度。补一条下缘背光 —— 光源在顶部，玻璃下沿只会反射到一点点光。
+        // 左右各内缩 14pt，避开圆角区，免得线头露在弧线上。
+        _bottomRim = [[UIView alloc] initWithFrame:CGRectZero];
+        _bottomRim.userInteractionEnabled = NO;
+        _bottomRim.translatesAutoresizingMaskIntoConstraints = NO;
+        [_effect.contentView addSubview:_bottomRim];
+
         [NSLayoutConstraint activateConstraints:@[
             [_effect.topAnchor constraintEqualToAnchor:self.topAnchor],
             [_effect.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
@@ -674,6 +733,10 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
             [_sheen.leadingAnchor constraintEqualToAnchor:_effect.contentView.leadingAnchor],
             [_sheen.trailingAnchor constraintEqualToAnchor:_effect.contentView.trailingAnchor],
             [_sheen.heightAnchor constraintEqualToAnchor:_effect.contentView.heightAnchor multiplier:0.55],
+            [_bottomRim.leadingAnchor constraintEqualToAnchor:_effect.contentView.leadingAnchor constant:26],
+            [_bottomRim.trailingAnchor constraintEqualToAnchor:_effect.contentView.trailingAnchor constant:-26],
+            [_bottomRim.bottomAnchor constraintEqualToAnchor:_effect.contentView.bottomAnchor],
+            [_bottomRim.heightAnchor constraintEqualToConstant:1.0],
         ]];
 
         [self sio_applyTheme];
@@ -686,13 +749,24 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
 - (void)sio_applyTheme {
     BOOL dark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     BOOL systemGlass = (NSClassFromString(@"UIGlassEffect") != nil);
-    _effect.effect = SIOGlassEffect(nil);
-    _tint.backgroundColor = self.glassTint ?: (systemGlass ? SIOSurfaceGlass26() : SIOSurface());
+    // v2.5.0（美术第 5 条：模糊必须可降级）。
+    // 系统「减弱透明度」打开后不能还硬叠模糊 —— 那是无障碍设置，用户明确要求关掉透明效果。
+    // 降级成不透明面，但保留描边与高光，所以不会塌成一块灰板。
+    BOOL reduce = UIAccessibilityIsReduceTransparencyEnabled();
+    UIVisualEffect *fx = reduce ? nil : SIOGlassEffect(nil);
+    // 去重：didMoveToWindow 与 traitCollectionDidChange 都会调到这里，
+    // 每次重新赋值 effect 会让 UIVisualEffectView 重建内部模糊层（完整分层 + 采样）。
+    if (_effect.effect != fx) _effect.effect = fx;
+    _tint.backgroundColor = reduce
+        ? SIOSurfaceStrong()
+        : (self.glassTint ?: (systemGlass ? SIOSurfaceGlass26() : SIOSurface()));
     self.layer.borderColor = SIOBorder().CGColor;
     self.layer.shadowOpacity = self.elevated ? (dark ? 0.42f : 0.10f) : 0.0f;
     self.layer.shadowColor = (dark ? [UIColor blackColor]
                                    : SIO_RGBA(0.04,0.16,0.14,1.0)).CGColor;
     _sheen.alpha = dark ? 0.55 : 1.0;
+    // 下缘背光：深色下几乎不可见（0.06），浅色下给一点（0.35），保持「上亮下暗」的单光源关系
+    _bottomRim.backgroundColor = SIOOnGlass(dark ? 0.06 : 0.35);
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previous {
@@ -722,6 +796,10 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
 @end
 
 #pragma mark - 玻璃按钮（轻量：不叠模糊，只做半透明色 + 描边 + 按压反馈）
+// v2.5.0（美术第 2 条：材质最多三层）：底（光斑）→ 玻璃（模糊 + tint）→ 内容。
+// 玻璃上禁止再叠一层模糊 —— 每叠一层，GPU 合成层数翻一倍，颜色还会发灰。
+// 按钮这类小元件只做半透明色 + 描边（本类就是这么做的），卡片内部也禁止再放
+// SIOGlassView。想加"玻璃感"就把 tint 加浓、描边提亮，不要再加模糊。
 
 @interface SIOGlassButton : UIButton
 @property (nonatomic, assign) CGFloat glassRadius;
@@ -737,7 +815,7 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
 - (instancetype)initWithRadius:(CGFloat)r {
     if ((self = [super initWithFrame:CGRectZero])) {
         _glassRadius = r;
-        _pressScale = 0.975;
+        _pressScale = SIO_PRESS_SCALE;   // v2.5.0：统一常量，见「美术七条」第 7 条
         self.layer.cornerRadius = r;
         self.layer.cornerCurve = kCACornerCurveContinuous;
         self.layer.borderWidth = 1.0;
@@ -776,7 +854,7 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
     [super setHighlighted:highlighted];
     CGFloat s = highlighted ? self.pressScale : 1.0;
     CGFloat a = highlighted ? 0.92 : 1.0;
-    [UIView animateWithDuration:(highlighted ? 0.12 : 0.18)
+    [UIView animateWithDuration:(highlighted ? SIO_PRESS_IN : SIO_PRESS_OUT)
                           delay:0
                         options:(UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction |
@@ -824,6 +902,10 @@ static UIVisualEffect *SIOGlassEffect(UIColor *tint) {
 - (void)sio_applyTheme {
     BOOL dark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     self.backgroundColor = SIOBG();
+    // v2.5.0（美术第 6 条：暗色必须有可折射的底）：深色这三档不低于
+    // 0.34 / 0.26 / 0.19。再低玻璃就没有可折射之物，整屏变成「黑底 + 灰板」——
+    // v2.5.1 真机踩过这个坑（当时 0.20 / 0.15 / 0.10，深色下几乎看不见光斑）。
+    // 底色也不许用纯黑：现在是 0.020/0.031/0.043，留了一点点色相。
     UIColor *emerald = dark ? SIO_RGBA(0.16,0.78,0.58,0.34) : SIO_RGBA(0.24,0.83,0.63,0.42);
     UIColor *sky     = dark ? SIO_RGBA(0.22,0.58,0.90,0.26) : SIO_RGBA(0.32,0.62,0.95,0.32);
     UIColor *lime    = dark ? SIO_RGBA(0.74,0.84,0.38,0.19) : SIO_RGBA(0.85,0.92,0.45,0.30);
@@ -1040,7 +1122,7 @@ static UITextView *SIOFieldTextView(CGFloat minHeight) {
     tv.backgroundColor = SIOSurfaceStrong();
     tv.textColor = SIOTextPri();
     tv.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
-    tv.layer.cornerRadius = 14;
+    tv.layer.cornerRadius = SIOInnerRadius(26.0, 16.0);   // v2.5.0：与卡片同心（=10，原写死 14）
     if (@available(iOS 13.0, *)) tv.layer.cornerCurve = kCACornerCurveContinuous;
     tv.layer.borderWidth = 1;
     tv.layer.borderColor = SIOBorderSoft().CGColor;
@@ -1428,6 +1510,20 @@ static void SIOStyleSegmented(UISegmentedControl *seg) {
         ? @"×1 = 不额外加速。push/pop/模态弹窗按全局倍率缩放。"
         : [NSString stringWithFormat:@"导航/模态/Tab 转场在全局倍率上再 ÷%.1f，块动画不受影响；慢放不叠加。", tb];
 
+    // v2.5.0（B-3）：瞬切开着时，转场倍率根本不参与计算。
+    // dylib 的 SIO_transitionDuration 在 gInstantTransition 分支直接 return 时长下限，
+    // 倍率那一步永远走不到 —— 而这里原来照样显示「再 ÷3」，并且档位可点。
+    // 那是标准的假开关。现在灰掉 + 明说原因，用户不用去猜「为什么调了没反应」。
+    if (self.swInstant && self.segTrans) {
+        BOOL instant = self.swInstant.on;
+        self.segTrans.enabled = !instant;
+        self.segTrans.alpha   = instant ? 0.45 : 1.0;
+        if (instant) {
+            self.lblTrans.textColor = SIOTextTer();
+            self.lblTrans.text = @"当前「瞬时打开页面」已开：转场固定压到时长下限，本档不参与计算。"
+                                 "想用倍率请先关掉它。";
+        }
+    }
 }
 
 - (void)refreshOverrides {
@@ -1673,18 +1769,19 @@ static void SIOStyleSegmented(UISegmentedControl *seg) {
     // v2.3.3（审查 P0）：原来 WriteConfig 失败时 WriteAxBatch / WriteUIKitDrag 仍落盘，
     // 但 save 只返回 WriteConfig 的 ok —— 用户看到「保存失败」，辅助功能三项与
     // UIKit 拖拽系数其实已被改，下次保存还会带着这些"幽灵改动"。
-    // 现在聚合三者返回值：任一失败即返回 NO，让调用方知道并非整体成功。
-    BOOL ok       = WriteConfig(cfg);
+    // 现在聚合两者返回值：任一失败即返回 NO，让调用方知道并非整体成功。
+    // v2.5.0（P-1）：drag 系数已并入 WriteConfig，同一个 plist 只写一次
+    //（原来是两次完整读-改-写，中间被 kill 会只落下其中一项）。
+    double dragCoeff = self.swEnabled.on
+        ? DragCoeffForIndex((int)self.segDrag.selectedSegmentIndex)
+        : 0.0;
+    BOOL ok       = WriteConfig(cfg, dragCoeff);
     BOOL axOk     = WriteAxBatch(@{ @"ReduceMotionEnabled":        @(self.swRM.on),
                                     @"PreferCrossFadeTransitions": @(self.swCF.on),
                                     @"ReduceTransparencyEnabled":  @(self.swRT.on) });
-    BOOL dragOk   = WriteUIKitDrag(self.swEnabled.on
-                   ? DragCoeffForIndex((int)self.segDrag.selectedSegmentIndex)
-                   : 0.0);
     if (!ok)       NSLog(@"[SIO] save: WriteConfig failed");
     if (!axOk)     NSLog(@"[SIO] save: WriteAxBatch failed");
-    if (!dragOk)   NSLog(@"[SIO] save: WriteUIKitDrag failed");
-    return ok && axOk && dragOk;
+    return ok && axOk;
 }
 
 // v2.1.20（功能增强）：恢复出厂设置。
@@ -1703,6 +1800,7 @@ static void SIOStyleSegmented(UISegmentedControl *seg) {
     mkdir("/var/Managed Preferences/mobile", 0755);
     BOOL ok = [d writeToFile:PrefPath atomically:YES];
     if (!ok) return NO;
+    SIOInvalidateConfigCache();   // v2.5.0：盘上内容已变，快照立即作废
     // 辅助功能三项一并回原生（这三项是 App 代写的系统开关）
     WriteAxBatch(@{ @"ReduceMotionEnabled":        @NO,
                     @"PreferCrossFadeTransitions": @NO,
@@ -2940,6 +3038,12 @@ static BOOL SIOColorIsRed(UIColor *c) {
         SIORowSub(@"场景伪装引擎", @"推荐。让系统认为 App 仍在前台", m.swFUBGScene),
         SIORowSub(@"音频断言兜底", @"静音白噪，需 App 声明 audio 后台模式", m.swFUBGAudio),
     ], 14)];
+    // v2.5.0：抖音家族内置排除（用户口径：只剔除真后台，动画加速照常生效）
+    [self.stack addArrangedSubview:SIOLabel(
+        @"抖音 / 抖音极速版 / 抖音火山版 / TikTok 已在内置排除名单：不参与真后台保活"
+        "（不抢音频会话、不伪装前后台、不起看门狗），动画加速与手感完全不受影响。"
+        "这是内置安全名单，本页开关对其无效。",
+        12, SIOTextSec())];
 
     m.swRM = [[UISwitch alloc] init];
     m.swCF = [[UISwitch alloc] init];
@@ -3011,7 +3115,7 @@ static BOOL SIOColorIsRed(UIColor *c) {
     m.ovBundle.borderStyle = UITextBorderStyleNone;
     m.ovBundle.backgroundColor = SIOSurfaceStrong();
     m.ovBundle.textColor = SIOTextPri();
-    m.ovBundle.layer.cornerRadius = 14;
+    m.ovBundle.layer.cornerRadius = SIOInnerRadius(26.0, 16.0);   // v2.5.0：与卡片同心（原 14）
     if (@available(iOS 13.0, *)) m.ovBundle.layer.cornerCurve = kCACornerCurveContinuous;
     m.ovBundle.layer.borderWidth = 1;
     m.ovBundle.layer.borderColor = SIOBorderSoft().CGColor;
@@ -3138,7 +3242,7 @@ static BOOL SIOColorIsRed(UIColor *c) {
     // v2.5.0：报告区改成「凹进去的玻璃槽」—— 比卡片更暗一档，和正文区分开
     self.reportView.backgroundColor = SIOTrack();
     self.reportView.textColor = SIOTextSec();
-    self.reportView.layer.cornerRadius = 14;
+    self.reportView.layer.cornerRadius = SIOInnerRadius(26.0, 16.0);   // v2.5.0：与卡片同心（原 14）
     if (@available(iOS 13.0, *)) self.reportView.layer.cornerCurve = kCACornerCurveContinuous;
     self.reportView.textContainerInset = UIEdgeInsetsMake(12, 10, 12, 10);
     [self.reportView.heightAnchor constraintEqualToConstant:300].active = YES;
@@ -3626,7 +3730,7 @@ static BOOL SIOColorIsRed(UIColor *c) {
 - (void)setSelected:(BOOL)selected {
     [super setSelected:selected];
     self.capLabel.font = SIOFont(10, selected ? UIFontWeightSemibold : UIFontWeightMedium);
-    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionBeginFromCurrentState
+    [UIView animateWithDuration:SIO_PRESS_OUT delay:0 options:UIViewAnimationOptionBeginFromCurrentState
                      animations:^{
         self.pill.alpha = selected ? 1.0 : 0.0;
         self.iconView.tintColor = selected ? SIOAccent() : SIOTextSec();
@@ -3636,12 +3740,12 @@ static BOOL SIOColorIsRed(UIColor *c) {
 
 - (void)setHighlighted:(BOOL)highlighted {
     [super setHighlighted:highlighted];
-    [UIView animateWithDuration:(highlighted ? 0.12 : 0.18)
+    [UIView animateWithDuration:(highlighted ? SIO_PRESS_IN : SIO_PRESS_OUT)
                           delay:0
                         options:(UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
                      animations:^{
-        self.transform = highlighted ? CGAffineTransformMakeScale(0.95, 0.95)
+        self.transform = highlighted ? CGAffineTransformMakeScale(SIO_TAB_SCALE, SIO_TAB_SCALE)
                                      : CGAffineTransformIdentity;
         self.alpha = highlighted ? 0.9 : 1.0;
     } completion:nil];
