@@ -70,10 +70,13 @@ def main():
         return 2
     path = sys.argv[1]
     want_keys = []
+    allow_unsigned = False
     argv = sys.argv[2:]
     for i, a in enumerate(argv):
         if a == "--entitlements-key" and i + 1 < len(argv):
             want_keys.append(argv[i + 1])
+        elif a == "--allow-unsigned":
+            allow_unsigned = True
 
     data = open(path, "rb").read()
     print(f"文件: {path}  {len(data):,} 字节")
@@ -112,6 +115,10 @@ def main():
         print(f"  依赖: {len(deps)} 个，全部是设备路径 ✓")
 
     if not cs:
+        if allow_unsigned:
+            print("  （未签名 dylib —— 注入器会整体重签，这是 v2.5.4 起的预期状态）")
+            print("  结论: PASS")
+            return 0
         fatal("没有 LC_CODE_SIGNATURE")
 
     do, ds = cs
