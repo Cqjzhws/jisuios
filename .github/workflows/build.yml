@@ -1,5 +1,11 @@
 name: Build 极速IOS (dylib + IPA)
 
+# v2.5.1：构建机从 macos-14 改为 ubuntu-latest + zig 交叉编译。
+# 原因：#73 / #74 两次运行都是「未分配 runner、steps=0、无日志」直接被取消，
+# 属账号/计费层的 macOS runner 拦截，与代码无关。ubuntu 对公开仓库免费且无 macOS 额度限制。
+# 签名不用 codesign：用仓库自带 tools/adhoc_sign.py 构造 CodeDirectory + entitlements，
+# TrollStore 安装时能读出 entitlements（与 v2.4.6 的 codesign -s - 等价）。
+
 on:
   workflow_dispatch:
   push:
@@ -8,65 +14,107 @@ on:
 permissions:
   contents: write
 
+env:
+  SDK_VER: "16.5"
+  IOS_MIN: "14.0"
+  # theos/sdks 的固定 release（资产不随 master 变动，避免 URL 失效）
+  SDK_URL: "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+
 jobs:
   build:
     name: Build 极速IOS dylib + IPA
-    runs-on: macos-14
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       # ⓪ 配置契约门禁：假开关 / 默认值分叉 / 专属覆盖丢键，任一命中直接失败
       - name: Config contract check
-        run: |
-          set -e
-          python3 tools/config_contract.py Tweak/SIOriginal.m App/main.m
+        run: python3 tools/config_contract.py Tweak/SIOriginal.m App/main.m
 
-      # ① dylib — 纯 runtime，无 Substrate（TrollFools 注入）
-      - name: Build dylib (pure clang)
+      # ⓪' 静态门禁：orig IMP 判空、残留引用等
+      - name: Static check
+        run: python3 tools/static_check.py .
+
+      # ① 工具链：zig（自带 clang + lld）与 iPhoneOS SDK
+      - name: Install zig + iPhoneOS SDK
         run: |
           set -e
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK: $SDK"
+          pip install --quiet ziglang
+          echo "zig: $(python -m ziglang version)"
+          mkdir -p "$HOME/sdk"
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o /tmp/sdk.tar.xz "$SDK_URL"
+          tar -xJf /tmp/sdk.tar.xz -C "$HOME/sdk"
+          SDK="$HOME/sdk/iPhoneOS${SDK_VER}.sdk"
+          test -d "$SDK" || { echo "SDK 解压目录不对:"; ls "$HOME/sdk"; exit 1; }
+          # 这套 SDK 用符号链接，tar 解压后头文件可能在 usr/include；缺了就报错，别静默降级
+          test -f "$SDK/usr/include/objc/objc.h" || { echo "缺 objc 头文件"; exit 1; }
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          echo "SDK 就绪: $SDK"
+
+      # ② dylib — 纯 runtime，无 Substrate（TrollFools 注入）
+      #    -headerpad 必须留：adhoc_sign.py 要在 load commands 尾部插 LC_CODE_SIGNATURE
+      - name: Build dylib (zig cc cross)
+        run: |
+          set -e
           mkdir -p artifacts
-          clang -arch arm64 -dynamiclib -O2 \
-            -install_name @rpath/SIOriginal.dylib \
+          python -m ziglang cc \
+            -target "aarch64-ios.${IOS_MIN}" \
             -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -undefined dynamic_lookup -fobjc-arc \
-            -framework Foundation -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
+            -isystem "$SDK/usr/include" \
+            -F "$SDK/System/Library/Frameworks" \
+            -I Tweak \
+            -fobjc-arc -fblocks -O2 -w \
+            -shared \
+            -Wl,-install_name,@rpath/SIOriginal.dylib \
+            -Wl,-headerpad,0x4000 \
+            -Wl,-undefined,dynamic_lookup \
+            -L "$SDK/usr/lib" \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
+            -lobjc \
             -o artifacts/SIOriginal.dylib Tweak/SIOriginal.m
-          codesign --force --sign - artifacts/SIOriginal.dylib
-          lipo -info artifacts/SIOriginal.dylib
+          python3 tools/adhoc_sign.py artifacts/SIOriginal.dylib com.local.sioriginal.dylib entitlements.plist
           file artifacts/SIOriginal.dylib
           echo "dylib size: $(du -h artifacts/SIOriginal.dylib | cut -f1)"
 
-      # ② 配置 App IPA（桌面显示名：极速IOS）
+      # ③ 配置 App IPA（桌面显示名：极速IOS）
       - name: Build app & IPA
         run: |
           set -e
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           APP="build/SIOriginal.app"
           rm -rf build
           mkdir -p "$APP"
 
-          clang -arch arm64 -O2 \
+          python -m ziglang cc \
+            -target "aarch64-ios.${IOS_MIN}" \
             -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -fobjc-arc \
-            -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
+            -isystem "$SDK/usr/include" \
+            -F "$SDK/System/Library/Frameworks" \
+            -fobjc-arc -fblocks -O2 -w \
+            -Wl,-headerpad,0x4000 \
+            -L "$SDK/usr/lib" \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
+            -lobjc \
             -o "$APP/SIOriginal" App/main.m
 
           cp App/Info.plist "$APP/Info.plist"
           cp App/AppIcon.png "$APP/AppIcon.png"
-          for f in App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          for f in App/Icon-*.png; do cp "$f" "$APP/$(basename "$f")"; done
           # 首页主人头像（App 内 imageWithContentsOfFile 加载）
           cp App/Owner.jpg "$APP/Owner.jpg"
-          codesign --force --sign - --entitlements entitlements.plist "$APP"
+
+          # ad-hoc 签名 + 注入 entitlements（等价于 macos 上的 codesign -s - --entitlements）
+          python3 tools/adhoc_sign.py "$APP/SIOriginal" com.local.sioriginal entitlements.plist
+          chmod 755 "$APP/SIOriginal"
+          file "$APP/SIOriginal"
 
           mkdir -p build/Payload
           cp -R "$APP" build/Payload/SIOriginal.app
@@ -79,6 +127,21 @@ jobs:
           ls -lh artifacts/
           file artifacts/SIOriginal.dylib
           unzip -l "artifacts/极速IOS.ipa"
+          # IPA 里必须有主二进制、Info.plist 与图标，缺一个都算失败
+          python3 - <<'PY'
+          import zipfile, sys
+          z = zipfile.ZipFile("artifacts/极速IOS.ipa")
+          names = set(z.namelist())
+          need = ["Payload/SIOriginal.app/SIOriginal",
+                  "Payload/SIOriginal.app/Info.plist",
+                  "Payload/SIOriginal.app/AppIcon.png"]
+          missing = [n for n in need if n not in names]
+          if missing:
+              print("IPA 缺文件:", missing); sys.exit(1)
+          info = z.getinfo("Payload/SIOriginal.app/SIOriginal")
+          print("主二进制大小:", info.file_size)
+          print("IPA 条目数:", len(names))
+          PY
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

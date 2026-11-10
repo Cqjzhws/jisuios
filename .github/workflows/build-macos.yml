@@ -1,0 +1,83 @@
+name: Build 极速IOS (macOS, 备用)
+
+# 备用通道：只在手动触发，不跟随 tag。
+# 主通道见 build.yml（ubuntu + zig 交叉编译）。
+# 这个文件保留的原因：哪天账号的 macOS runner 额度恢复，macOS 原生 clang 构建
+# 仍然是验证力最强的一条路（能跑 codesign、lipo、xcrun 全套）。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build 极速IOS dylib + IPA (macOS)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Config contract check
+        run: |
+          set -e
+          python3 tools/config_contract.py Tweak/SIOriginal.m App/main.m
+
+      - name: Build dylib (pure clang)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p artifacts
+          clang -arch arm64 -dynamiclib -O2 \
+            -install_name @rpath/SIOriginal.dylib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -undefined dynamic_lookup -fobjc-arc \
+            -Wl,-headerpad,0x4000 \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
+            -o artifacts/SIOriginal.dylib Tweak/SIOriginal.m
+          codesign --force --sign - artifacts/SIOriginal.dylib
+          lipo -info artifacts/SIOriginal.dylib
+          file artifacts/SIOriginal.dylib
+          echo "dylib size: $(du -h artifacts/SIOriginal.dylib | cut -f1)"
+
+      - name: Build app & IPA
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP="build/SIOriginal.app"
+          rm -rf build
+          mkdir -p "$APP"
+
+          clang -arch arm64 -O2 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -Wl,-headerpad,0x4000 \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
+            -o "$APP/SIOriginal" App/main.m
+
+          cp App/Info.plist "$APP/Info.plist"
+          cp App/AppIcon.png "$APP/AppIcon.png"
+          for f in App/Icon-*.png; do cp "$f" "$APP/$(basename $f)"; done
+          cp App/Owner.jpg "$APP/Owner.jpg"
+          codesign --force --sign - --entitlements entitlements.plist "$APP"
+
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/SIOriginal.app
+          ( cd build && zip -qry "../artifacts/极速IOS.ipa" Payload -x "*.DS_Store" )
+          echo "IPA size: $(du -h "artifacts/极速IOS.ipa" | cut -f1)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 极速IOS-artifacts-macos
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
