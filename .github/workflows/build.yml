@@ -60,6 +60,18 @@ jobs:
           echo "SDK=$SDK" >> "$GITHUB_ENV"
           echo "SDK 就绪: $SDK"
 
+      # ② 签名器：ldid（Procursus 版）。v2.5.5 起用它替代自写的 adhoc_sign.py。
+      # 理由：手写 CodeDirectory 两次出错（槽位 -1/-5、注入器解析崩溃），
+      # 而 ldid 就是 TrollStore 自己在用的签名器，输出与 codesign 同构（special slots 7 个）。
+      - name: Install ldid
+        run: |
+          set -e
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+            -o ldid "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64"
+          chmod +x ldid
+          ./ldid 2>&1 | head -2
+          echo "LDID=$PWD/ldid" >> "$GITHUB_ENV"
+
       # ② dylib — 纯 runtime，无 Substrate（TrollFools 注入）
       #    -headerpad 必须留：adhoc_sign.py 要在 load commands 尾部插 LC_CODE_SIGNATURE
       - name: Build dylib (zig cc cross)
@@ -117,8 +129,10 @@ jobs:
           # 首页主人头像（App 内 imageWithContentsOfFile 加载）
           cp App/Owner.jpg "$APP/Owner.jpg"
 
-          # ad-hoc 签名 + 注入 entitlements（等价于 macos 上的 codesign -s - --entitlements）
-          python3 tools/adhoc_sign.py "$APP/SIOriginal" com.local.sioriginal entitlements.plist
+          # v2.5.5：签名交给 ldid（与 TrollStore 同款签名器），不再手写 CodeDirectory。
+          # entitlements 决定 App 有没有 no-sandbox / platform-application ——
+          # 没有这两项就写不进 /var/Managed Preferences，表现为「保存失败」。
+          "$LDID" -S entitlements.plist "$APP/SIOriginal"
           chmod 755 "$APP/SIOriginal"
           file "$APP/SIOriginal"
 

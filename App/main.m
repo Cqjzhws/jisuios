@@ -102,6 +102,64 @@ static void SpawnRootNowait(NSString *path, NSArray *args) {
     if (rc != 0) NSLog(@"[SIO] SpawnRootNowait %@ failed: rc=%d (%s)", path, rc, strerror(rc));
 }
 
+// v2.5.5：直接问内核「本进程到底有没有这些权限」，不再靠 access() 反推。
+// v2.5.0~2.5.4 连续四轮都在猜写盘失败的原因（先猜代码、再猜签名槽位），
+// 真机上自检页显示「配置目录可写 ❌ / 辅助功能目录可写 ❌」才把范围收窄到进程身份。
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define SIO_CS_OPS_STATUS            0
+#define SIO_CS_OPS_ENTITLEMENTS_BLOB 7
+#define SIO_CS_PLATFORM_BINARY       0x04000000
+
+static NSString *SIOEntitlementSummary(void) {
+    NSMutableArray *keys = [NSMutableArray array];
+    static char buf[16384];
+    memset(buf, 0, sizeof(buf));
+    int rc = csops(getpid(), SIO_CS_OPS_ENTITLEMENTS_BLOB, buf, sizeof(buf) - 1);
+    NSString *xml = (rc == 0 && buf[0]) ? [NSString stringWithUTF8String:buf] : nil;
+    if (xml.length) {
+        struct { const char *k; NSString *label; } map[] = {
+            { "platform-application",                    @"platform-application" },
+            { "com.apple.private.security.no-sandbox",   @"no-sandbox" },
+            { "com.apple.private.persona-mgmt",          @"persona-mgmt" },
+            { "get-task-allow",                          @"get-task-allow" },
+        };
+        for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+            NSString *k = [NSString stringWithUTF8String:map[i].k];
+            if ([xml containsString:[NSString stringWithFormat:@"<key>%@</key>", k]])
+                [keys addObject:map[i].label];
+        }
+    }
+    unsigned int flags = 0;
+    BOOL platform = (csops(getpid(), SIO_CS_OPS_STATUS, &flags, sizeof(flags)) == 0)
+                    && (flags & SIO_CS_PLATFORM_BINARY);
+    if (!keys.count)
+        return [NSString stringWithFormat:@"❌ 无任何特权 entitlements（rc=%d）%@ —— 该装法不会给权限",
+                rc, platform ? @" · platform 位仍在" : @""];
+    return [NSString stringWithFormat:@"%@%@", [keys componentsJoinedByString:@" + "],
+            platform ? @" · platform 位 ✓" : @""];
+}
+
+// v2.5.5：写盘失败时把现场打出来（errno / 属主 / root 提权是否可用）。
+static int gLastWriteErrno = 0;
+
+static NSString *SIOWriteDiag(void) {
+    NSMutableString *s = [NSMutableString string];
+    struct stat st;
+    const char *dir = "/var/Managed Preferences/mobile";
+    [s appendFormat:@"进程权限：%@", SIOEntitlementSummary()];
+    if (stat(dir, &st) == 0)
+        [s appendFormat:@"\n目录：%d:%d %03o", st.st_uid, st.st_gid, st.st_mode & 0777];
+    else
+        [s appendFormat:@"\n目录缺失 errno=%d", errno];
+    if (stat(PrefPath.fileSystemRepresentation, &st) == 0)
+        [s appendFormat:@" · 文件：%d:%d %03o", st.st_uid, st.st_gid, st.st_mode & 0777];
+    else
+        [s appendFormat:@" · 文件不存在"];
+    if (gLastWriteErrno)
+        [s appendFormat:@"\n写盘 errno=%d %s", gLastWriteErrno, strerror(gLastWriteErrno)];
+    return s;
+}
+
 static NSString *SIOReboot(void) {
     pid_t pid;
 
@@ -292,13 +350,29 @@ static BOOL WriteConfig(NSMutableDictionary *cfg, double dragCoeff) {
         // root 拥有的进程（或旧版提权写入器）动过，目录/旧 plist 属主漂移成 root，
         // mobile 身份的 App 原子写（先建临时文件再 rename）必败（EPERM），表现为
         // 点保存永远失败。借 TrollStore persona 提权把属主还回 mobile 再重试一次。
+        gLastWriteErrno = errno;   // v2.5.5：记下第一次失败的 errno，弹窗里要显示
         NSLog(@"[SIO] WriteConfig direct write failed (errno=%d %s), fixing ownership as root and retrying",
               errno, strerror(errno));
         SpawnRoot(@"/usr/sbin/chown", @[@"-R", @"mobile:mobile", @"/var/Managed Preferences/mobile"]);
         SpawnRoot(@"/bin/chmod", @[@"755", @"/var/Managed Preferences/mobile"]);
         ok = [merged writeToFile:PrefPath atomically:YES];
-        if (!ok) NSLog(@"[SIO] WriteConfig retry after chown still failed (errno=%d %s)",
-                       errno, strerror(errno));
+        if (!ok) {
+            gLastWriteErrno = errno;
+            // v2.5.5 兜底二：自己写不进去时，写临时文件再借 root 拷过去。
+            // 这条路在「目录属主是 root、但当前进程完全没有 entitlements」时同样会失败，
+            // 失败时会原样反映在 errno 里，不再吞掉。
+            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"sio_cfg.plist"];
+            if (tmp.length && [merged writeToFile:tmp atomically:YES]) {
+                SpawnRoot(@"/bin/cp", @[tmp, PrefPath]);
+                SpawnRoot(@"/usr/sbin/chown", @[@"mobile:mobile", PrefPath]);
+                SpawnRoot(@"/bin/chmod", @[@"644", PrefPath]);
+                NSDictionary *back = [NSDictionary dictionaryWithContentsOfFile:PrefPath];
+                ok = (back != nil);
+                if (!ok) gLastWriteErrno = errno;
+            }
+            NSLog(@"[SIO] WriteConfig retry after chown/cp still failed (errno=%d %s)",
+                  errno, strerror(errno));
+        }
     }
     if (ok) {
         SIOInvalidateConfigCache();   // v2.5.0：盘上内容已变，快照立即作废
@@ -2275,6 +2349,8 @@ static void SIOCheckRange(NSMutableArray *problems, NSDictionary *d, NSString *k
     [r appendFormat:@"UIKit.plist 存在：%@\n", plistExists ? @"✅" : @"➖ 尚未保存过"];
     BOOL axWritable = access("/var/mobile/Library/Preferences", W_OK) == 0;
     [r appendFormat:@"辅助功能目录可写：%@\n", axWritable ? @"✅" : @"❌"];
+    // v2.5.5：进程到底拿到了哪些特权，直接问内核；写盘失败时这一行就是答案
+    [r appendFormat:@"进程特权：%@\n", SIOEntitlementSummary()];
 
     NSDictionary *pd = [NSDictionary dictionaryWithContentsOfFile:PrefPath];
     if ([pd isKindOfClass:[NSDictionary class]]) {
@@ -2636,7 +2712,7 @@ static BOOL SIOColorIsRed(UIColor *c) {
             alertControllerWithTitle:blocked ? @"⚠️ 配置校验未通过" : @"❌ 保存失败"
             message:blocked
                 ? [NSString stringWithFormat:@"已阻止落盘，请修正以下问题：\n%@", self.model.lastValidationError]
-                : @"无法写入 com.apple.UIKit.plist，请确认 TrollStore 权限正常。"
+                : [NSString stringWithFormat:@"无法写入 com.apple.UIKit.plist。\n\n%@", SIOWriteDiag()]
             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:a animated:YES completion:nil];
@@ -3611,7 +3687,7 @@ static BOOL SIOColorIsRed(UIColor *c) {
                 alertControllerWithTitle:ok ? @"已恢复出厂设置" : @"恢复失败"
                 message:ok ? @"已清空 极速IOS 的全部配置键，并广播热重载；"
                              "目标 App 会在下次读取配置时回到出厂档（40× / ×5 / ×3 / 0.005s）。"
-                           : @"无法写入 com.apple.UIKit.plist，请确认 TrollStore 权限正常。"
+                           : [NSString stringWithFormat:@"无法写入 com.apple.UIKit.plist。\n\n%@", SIOWriteDiag()]
                 preferredStyle:UIAlertControllerStyleAlert];
             [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:r animated:YES completion:nil];
