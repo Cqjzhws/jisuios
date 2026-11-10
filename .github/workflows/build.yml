@@ -43,10 +43,12 @@ jobs:
         run: python3 tools/static_check.py .
 
       # ① 工具链：zig（自带 clang + lld）与 iPhoneOS SDK
+      #    zig 版本必须钉死：0.17.x 在 -target aarch64-ios 下会段错误（exit 139），
+      #    0.13.0 在 Windows 与本机验证过能出可用的 arm64 Mach-O（见 README「交叉编译」）。
       - name: Install zig + iPhoneOS SDK
         run: |
           set -e
-          pip install --quiet ziglang
+          pip install --quiet "ziglang==0.13.0"
           echo "zig: $(python -m ziglang version)"
           mkdir -p "$HOME/sdk"
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o /tmp/sdk.tar.xz "$SDK_URL"
