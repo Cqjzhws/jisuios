@@ -20,9 +20,17 @@ CSMAGIC_EMBEDDED_ENTITLEMENTS = 0xFADE7171
 CSSLOT_CODEDIRECTORY = 0
 CSSLOT_ENTITLEMENTS  = 5
 
+# v2.5.3 修复（真机「无法写入 plist」的根因）：
+# CodeDirectory 的 special slot 用「取负」编号 —— CSSLOT_ENTITLEMENTS=5 的哈希必须落在
+# 索引 -5，而不是 -1（-1 是 Info.plist 的槽位）。原来 nSpecialSlots 写成 1、哈希塞在 -1，
+# 结果 TrollStore/ldid 按 -5 去取 entitlements 取到空，App 退化成普通沙箱身份，
+# /var/Managed Preferences 一律 EPERM，表现就是「保存失败，请确认 TrollStore 权限」。
+# 对照物：v2.4.7（macOS codesign 签的）app 的 -5 值 = 4d046dd3…，与本脚本算出的
+# entitlements blob 哈希完全一致 —— 说明内容没错，只是放错了槽位。
+N_SPECIAL = 5           # 至少要覆盖到 -5
 PAGE = 4096
 HASH_SIZE = 32
-CD_HEADER = 44          # version 0x20001 的基础头长度
+CD_HEADER = 44          # version 0x20400 的基础头长度
 
 
 def be(*vals):
@@ -90,7 +98,7 @@ def sign(path: str, identifier: str, ents_path: str) -> None:
     ident_pad = (-len(ident)) % 4
     ident += b"\0" * ident_pad
 
-    cd_len = CD_HEADER + len(ident) + HASH_SIZE + n_code * HASH_SIZE
+    cd_len = CD_HEADER + len(ident) + N_SPECIAL * HASH_SIZE + n_code * HASH_SIZE
     ent_blob = build_entitlements_blob(xml)
     total = 12 + 2 * 8 + cd_len + len(ent_blob)
 
@@ -109,17 +117,19 @@ def sign(path: str, identifier: str, ents_path: str) -> None:
     if not has_cs:
         insert_codesig_cmd(buf, sig_off, total)
 
-    # 4) CodeDirectory：special slot -1 放 entitlements 的哈希
-    hash_offset = CD_HEADER + len(ident) + HASH_SIZE
+    # 4) CodeDirectory：entitlements 哈希放 special slot -5（= CSSLOT_ENTITLEMENTS）
+    #    特殊槽在 hashOffset 之前逆序排列：[-5][-4][-3][-2][-1]，-1 紧贴第一个 code slot。
+    hash_offset = CD_HEADER + len(ident) + N_SPECIAL * HASH_SIZE
     cd = bytearray()
-    cd += be(CSMAGIC_CODEDIRECTORY, cd_len, 0x20001, 0x2)   # flags=adhoc
-    cd += be(hash_offset, CD_HEADER, 1, n_code)
+    cd += be(CSMAGIC_CODEDIRECTORY, cd_len, 0x20400, 0x2)   # flags=adhoc
+    cd += be(hash_offset, CD_HEADER, N_SPECIAL, n_code)
     cd += be(code_limit)
     cd += bytes([HASH_SIZE, 2, 0, 12])                      # sha256 / platform / page 4096
     cd += be(0)                                             # spare2
     assert len(cd) == CD_HEADER, len(cd)
     cd += ident
-    cd += hashlib.sha256(ent_blob).digest()                 # slot -1
+    cd += hashlib.sha256(ent_blob).digest()                 # slot -5
+    cd += b"\0" * (HASH_SIZE * (N_SPECIAL - 1))             # slot -4 … -1（未使用，填 0）
     for i in range(n_code):
         page = bytes(buf[i * PAGE:(i + 1) * PAGE])
         cd += hashlib.sha256(page).digest()

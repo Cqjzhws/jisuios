@@ -129,6 +129,20 @@ jobs:
           ls -lh artifacts/
           file artifacts/SIOriginal.dylib
           unzip -l "artifacts/极速IOS.ipa"
+
+          # 签名槽位门禁：entitlements 哈希必须在 special slot -5。
+          # v2.5.1 就是栽在这里 —— 哈希写进了 -1，TrollStore 读不到 entitlements，
+          # App 以沙箱身份运行，保存配置全部 EPERM。
+          echo "=== dylib 签名校验 ==="
+          python3 tools/verify_signature.py artifacts/SIOriginal.dylib
+          echo "=== App 主二进制签名校验 ==="
+          rm -rf /tmp/verify && mkdir -p /tmp/verify
+          unzip -qo "artifacts/极速IOS.ipa" "Payload/SIOriginal.app/SIOriginal" -d /tmp/verify
+          python3 tools/verify_signature.py /tmp/verify/Payload/SIOriginal.app/SIOriginal \
+            --entitlements-key platform-application \
+            --entitlements-key com.apple.private.security.no-sandbox \
+            --entitlements-key com.apple.private.persona-mgmt
+
           # IPA 里必须有主二进制、Info.plist 与图标，缺一个都算失败
           python3 - <<'PY'
           import zipfile, sys
